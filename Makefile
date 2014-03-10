@@ -1,11 +1,11 @@
 clean:
 	rm -rf build proto/*.[ch]
 
-.PHONY : proto
+.DEFAULT_GOAL = all
 
-proto: proto/*.proto
+proto/%.c: proto/%.proto
 	protoc-c --proto_path proto --c_out proto proto/*.proto
 
-
-build/fuse-dfs-proto:
-	$(CC) -o build/fuse-dfs-proto proto/*.c src/*.c -lprotoc
+all: proto
+	mkdir -p build
+	$(CC) -o build/fuse-dfs-proto proto/*.c src/*.c -lprotobuf-c -lprotobuf-c-rpc -I.

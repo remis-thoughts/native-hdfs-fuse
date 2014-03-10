@@ -1,30 +1,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "proto/ClientNamenodeProtocol.pb-c.h"
+#include <google/protobuf-c/protobuf-c-rpc.h>
+
 
 int main (int argc, const char * argv[]) 
 {
-  AMessage msg = AMESSAGE__INIT; // AMessage
+  Hadoop__Hdfs__RenameRequestProto msg = HADOOP__HDFS__RENAME_REQUEST_PROTO__INIT;
   void *buf;                     // Buffer to store serialized data
   unsigned len;                  // Length of serialized data
 
-  if (argc != 2 && argc != 3)
-  {   // Allow one or two integers
-    fprintf(stderr,"usage: amessage a [b]\n");
+  if (argc != 3)
+  {
+    fprintf(stderr,"usage: src dest\n");
     return 1;
   }
 
-  msg.a = atoi(argv[1]);
-  if (argc == 3) { msg.has_b = 1; msg.b = atoi(argv[2]); }
-  len = amessage__get_packed_size(&msg);
+  msg.src = argv[1];
+  msg.dst = argv[2];
+  len = hadoop__hdfs__rename_request_proto__get_packed_size(&msg);
 
   buf = malloc(len);
-  amessage__pack(&msg,buf);
+  hadoop__hdfs__rename_request_proto__pack(&msg,buf);
 
-  fprintf(stderr,"Writing %d serialized bytes\n",len); // See the length of message
-  fwrite(buf,len,1,stdout); // Write to stdout to allow direct command line piping
+  fprintf(stderr,"Writing %d serialized bytes\n",len);
+  fwrite(buf,len,1,stdout);
 
-  free(buf); // Free the allocated serialized buffer
+  free(buf);
   return 0;
 }
 
