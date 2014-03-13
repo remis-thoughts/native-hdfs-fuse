@@ -2,10 +2,13 @@ clean:
 	rm -rf build proto/*.[ch]
 
 .DEFAULT_GOAL = all
+.PHONY : proto
 
-proto/%.c: proto/%.proto
+proto: proto/*.proto
 	protoc-c --proto_path proto --c_out proto proto/*.proto
 
-all: proto
+CCFLAGS := $(shell pkg-config --cflags libprotobuf-c) -Werror
+
+all:
 	mkdir -p build
-	$(CC) -o build/fuse-dfs-proto proto/*.c src/*.c -lprotobuf-c -lprotobuf-c-rpc -I.
+	$(CC) -o build/fuse-dfs-proto proto/*.c src/*.c /opt/local/lib/libprotobuf-c.a -I. $(CCFLAGS)
