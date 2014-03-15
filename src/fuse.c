@@ -36,7 +36,6 @@ static void dump_trace() {
 
 #endif
 
-static const char *hello_str = "Hello World!\n";
 static const char *hello_path = "/hello";
 
 #define CALL_NN(method) \
@@ -126,20 +125,15 @@ static int hello_open(const char *path, struct fuse_file_info *fi)
 static int hello_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi)
 {
-  size_t len;
+  (void) buf;
+  (void) size;
+  (void) offset;
   (void) fi;
+
   if(strcmp(path, hello_path) != 0)
     return -ENOENT;
 
-  len = strlen(hello_str);
-  if (offset < len) {
-    if (offset + size > len)
-      size = len - offset;
-    memcpy(buf, hello_str + offset, size);
-  } else
-    size = 0;
-
-  return size;
+  return 0;
 }
 
 static struct fuse_operations hello_oper = {
@@ -151,7 +145,7 @@ static struct fuse_operations hello_oper = {
 
 int main(int argc, char *argv[])
 {
-  struct connection_state state = {0};
+  struct connection_state state;
   uint16_t port;
   int result;
 
@@ -166,6 +160,7 @@ int main(int argc, char *argv[])
 #endif
 
   port = atoi(argv[2]);
+  memset(&state, 0, sizeof(state));
   result = hadoop_rpc_connect(&state, argv[1], port);
   if(result < 0)
   {

@@ -167,10 +167,7 @@ int hadoop_rpc_call(
 
 int hadoop_rpc_connect(struct connection_state * state, const char * host, const uint16_t port)
 {
-  ssize_t bytes;
-  void * contextbuf;
   uint32_t len;
-  uint32_t lentosend;
   uint8_t header[] = { 'h', 'r', 'p', 'c', 9, 0, 0};
   Hadoop__Common__IpcConnectionContextProto context = HADOOP__COMMON__IPC_CONNECTION_CONTEXT_PROTO__INIT;
   Hadoop__Common__UserInformationProto userinfo = HADOOP__COMMON__USER_INFORMATION_PROTO__INIT;
