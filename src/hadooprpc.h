@@ -15,12 +15,12 @@ struct connection_state {
 };
 
 int hadoop_rpc_connect(
-  struct connection_state * state, 
-  const char * host, 
+  struct connection_state * state,
+  const char * host,
   const uint16_t port);
 
 int hadoop_rpc_call(
-  struct connection_state * state, 
+  struct connection_state * state,
   const ProtobufCServiceDescriptor * service,
   const char * methodname,
   const ProtobufCMessage * in,
