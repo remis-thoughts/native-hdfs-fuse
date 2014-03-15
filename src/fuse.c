@@ -26,6 +26,7 @@
 #include "hadooprpc.h"
 
 #ifdef DEBUG
+
 static void dump_trace() {
   void * buffer[255];
   const int calls = backtrace(buffer,
