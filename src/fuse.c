@@ -137,34 +137,26 @@ static
 int hadoop_fuse_readlink(const char * path, char * buf, size_t len)
 {
   int res;
-  Hadoop__Hdfs__GetFileLinkInfoRequestProto request = HADOOP__HDFS__GET_FILE_LINK_INFO_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__GetFileLinkInfoResponseProto *response = NULL;
+  Hadoop__Hdfs__GetLinkTargetRequestProto request = HADOOP__HDFS__GET_LINK_TARGET_REQUEST_PROTO__INIT;
+  Hadoop__Hdfs__GetLinkTargetResponseProto *response = NULL;
 
-  request.src = (char *) path;
-  res = CALL_NN("getFileLinkInfo", request, response);
+  request.path = (char *) path;
+  res = CALL_NN("getLinkTarget", request, response);
   if(res < 0)
   {
     return -ENOENT;
   }
+  else if (!response->targetpath)
+  {
+    hadoop__hdfs__get_link_target_response_proto__free_unpacked(response, NULL);
+    return -ENOENT;
+  }
   else
   {
-    Hadoop__Hdfs__HdfsFileStatusProto * fs = response->fs;
-    if(!fs || !fs->has_symlink)
-    {
-      res = -ENOENT;
-    }
-    else if(fs->filetype != HADOOP__HDFS__HDFS_FILE_STATUS_PROTO__FILE_TYPE__IS_SYMLINK)
-    {
-      res = -EINVAL;
-    }
-    else
-    {
-      strncpy(buf, (const char *) fs->symlink.data, min(len, fs->symlink.len));
-      buf[len - 1] = '\0';
-      res = 0;
-    }
-    hadoop__hdfs__get_file_link_info_response_proto__free_unpacked(response, NULL);
-    return res;
+    strncpy(buf, response->targetpath, len);
+    buf[len - 1] = '\0';
+    hadoop__hdfs__get_link_target_response_proto__free_unpacked(response, NULL);
+    return 0;
   }
 }
 
