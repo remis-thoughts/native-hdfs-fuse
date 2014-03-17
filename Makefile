@@ -9,7 +9,7 @@ proto: proto/*.proto
 	protoc-c --proto_path proto --c_out proto proto/*.proto
 	$(UNCRUSTIFY) proto/*.[ch]
 
-CCFLAGS := $(shell pkg-config --cflags --libs fuse libprotobuf-c) -Werror -Wall -Wextra -I. -DDEBUG
+CCFLAGS := $(shell pkg-config --cflags --libs fuse libprotobuf-c) -Werror -Wall -Wextra -I.
 
 all:
 	mkdir -p build
