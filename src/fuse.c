@@ -161,6 +161,61 @@ int hadoop_fuse_readlink(const char * path, char * buf, size_t len)
 }
 
 static
+int hadoop_fuse_utimens(const char * src, const struct timespec tv[2])
+{
+  int res;
+  Hadoop__Hdfs__SetTimesRequestProto request = HADOOP__HDFS__SET_TIMES_REQUEST_PROTO__INIT;
+  Hadoop__Hdfs__SetTimesResponseProto *response = NULL;
+
+  request.src = (char *) src;
+  request.atime = tv[0].tv_sec * 1000 + tv[0].tv_nsec / 1000000;
+  request.mtime = tv[1].tv_sec * 1000 + tv[1].tv_nsec / 1000000;
+  res = CALL_NN("setTimes", request, response);
+  if(res < 0)
+  {
+    return -ENOENT;
+  }
+  else
+  {
+    hadoop__hdfs__set_times_response_proto__free_unpacked(response, NULL);
+    return 0;
+  }
+}
+
+static
+int hadoop_fuse_chown(const char * src, uid_t uid, gid_t gid)
+{
+  int res;
+  struct passwd * owner;
+  struct group * group;
+  Hadoop__Hdfs__SetOwnerRequestProto request = HADOOP__HDFS__SET_OWNER_REQUEST_PROTO__INIT;
+  Hadoop__Hdfs__SetOwnerResponseProto *response = NULL;
+
+  request.src = (char *) src;
+  owner = getpwuid(uid);
+  if(owner)
+  {
+    request.username = owner->pw_name;
+  }
+  group = getgrgid(gid);
+  if(group)
+  {
+    request.groupname = group->gr_name;
+  }
+
+  res = CALL_NN("setOwner", request, response);
+  if(res < 0)
+  {
+    return -ENOENT;
+  }
+  else
+  {
+    hadoop__hdfs__set_owner_response_proto__free_unpacked(response, NULL);
+    return 0;
+  }
+}
+
+static
 int hadoop_fuse_symlink(const char * target, const char * link)
 {
   int res;
@@ -415,6 +470,8 @@ struct fuse_operations hello_oper = {
   .mkdir = hadoop_fuse_mkdir,
   .symlink = hadoop_fuse_symlink,
   .statfs = hadoop_fuse_statfs,
+  .chown = hadoop_fuse_chown,
+  .utimens = hadoop_fuse_utimens,
   .open   = hello_open,
   .read   = hello_read,
 };
