@@ -5,6 +5,7 @@
 #include "proto/IpcConnectionContext.pb-c.h"
 #include "proto/ProtobufRpcEngine.pb-c.h"
 #include "proto/RpcHeader.pb-c.h"
+#include "proto/datatransfer.pb-c.h"
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -41,7 +42,8 @@ ssize_t hadoop_rpc_send_int32(const struct connection_state * state, const uint3
     len += lenlen; \
   } while(0)
 
-int hadoop_rpc_send_out_of_band(
+int
+hadoop_rpc_send_out_of_band(
   struct connection_state * state,
   const void * msgbuf,
   const uint32_t msglen,
@@ -70,7 +72,8 @@ int hadoop_rpc_send_out_of_band(
   }
 }
 
-int hadoop_rpc_call(
+int
+hadoop_rpc_call_namenode(
   struct connection_state * state,
   const ProtobufCServiceDescriptor * service,
   const char * methodname,
@@ -165,16 +168,25 @@ int hadoop_rpc_call(
   }
 }
 
-int hadoop_rpc_connect(struct connection_state * state, const char * host, const uint16_t port)
+int
+hadoop_rpc_disconnect(struct connection_state * state)
+{
+  int res = close(state->sockfd);
+  state->isconnected = false;
+  return res;
+}
+
+int
+hadoop_rpc_connect_namenode(struct connection_state * state, const char * host, const uint16_t port)
 {
   uint32_t len;
   uint8_t header[] = { 'h', 'r', 'p', 'c', 9, 0, 0};
   Hadoop__Common__IpcConnectionContextProto context = HADOOP__COMMON__IPC_CONNECTION_CONTEXT_PROTO__INIT;
   Hadoop__Common__UserInformationProto userinfo = HADOOP__COMMON__USER_INFORMATION_PROTO__INIT;
-  void *buf;
+  void * buf;
   int error;
 
-  state->sockfd = socket(AF_INET,SOCK_STREAM,0);
+  state->sockfd = socket(AF_INET, SOCK_STREAM, 0);
   state->servaddr.sin_family = AF_INET;
   state->servaddr.sin_addr.s_addr = inet_addr(host);
   state->servaddr.sin_port = htons(port);
@@ -209,7 +221,170 @@ int hadoop_rpc_connect(struct connection_state * state, const char * host, const
   return 0;
 
 fail:
-  close(state->sockfd);
-  state->isconnected = false;
+  hadoop_rpc_disconnect(state);
   return error;
 }
+
+int
+hadoop_rpc_connect_datanode(struct connection_state * state, const char * host, const uint16_t port)
+{
+  int res;
+
+  state->sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  state->servaddr.sin_family = AF_INET;
+  state->servaddr.sin_addr.s_addr = inet_addr(host);
+  state->servaddr.sin_port = htons(port);
+
+  res = connect(state->sockfd, (struct sockaddr *) &state->servaddr, sizeof(state->servaddr));
+  if(res < 0)
+  {
+    return -EHOSTUNREACH;
+  }
+  else
+  {
+    state->isconnected = true;
+    return 0;
+  }
+}
+
+int hadoop_rpc_call_datanode(
+  struct connection_state * state,
+  uint8_t type,
+  const ProtobufCMessage * in,
+  Hadoop__Hdfs__BlockOpResponseProto ** out)
+{
+  int res;
+  void * buf;
+  uint32_t len;
+  Hadoop__Hdfs__BlockOpResponseProto * response;
+  uint8_t responselen_varint[5];
+  uint8_t responselen_varintlen;
+  uint64_t responselen;
+  void * responsebuf;
+  uint8_t bytesinwrongbuf;
+  uint8_t header[] = { 0, 28, type };
+
+  res = hadoop_rpc_send(state, &header, sizeof(header));
+  if(res < 0)
+  {
+    return -EPROTO;
+  }
+  PACK(len, buf, in);
+  res = hadoop_rpc_send(state, buf, len);
+  if(res < 0)
+  {
+    return -EPROTO;
+  }
+
+  res = recvfrom(state->sockfd, &responselen_varint[0], sizeof(responselen_varint), MSG_WAITALL, NULL, NULL);
+  if(res < 0)
+  {
+    return res;
+  }
+  responselen = decode_unsigned_varint(&responselen_varint[0], &responselen_varintlen);
+  bytesinwrongbuf = 5 - responselen_varintlen;
+  responsebuf = alloca(responselen);
+  if(bytesinwrongbuf > 0)
+  {
+    // copy remaining bytes from buffer
+    memcpy(responsebuf, responselen_varint + responselen_varintlen, bytesinwrongbuf);
+  }
+  res = recvfrom(state->sockfd, responsebuf + bytesinwrongbuf, responselen - bytesinwrongbuf, MSG_WAITALL, NULL, NULL);
+  if(res < 0)
+  {
+    return res;
+  }
+  *out = response = hadoop__hdfs__block_op_response_proto__unpack(NULL, responselen, responsebuf);
+  switch(response->status)
+  {
+  case HADOOP__HDFS__STATUS__ERROR:
+    res = -EINVAL;
+    break;
+  case HADOOP__HDFS__STATUS__ERROR_CHECKSUM:
+    res = -EIO;
+    break;
+  case HADOOP__HDFS__STATUS__ERROR_INVALID:
+    res = -EINVAL;
+    break;
+  case HADOOP__HDFS__STATUS__ERROR_EXISTS:
+    res = -EEXIST;
+    break;
+  case HADOOP__HDFS__STATUS__ERROR_ACCESS_TOKEN:
+    res = -EACCES;
+    break;
+  case HADOOP__HDFS__STATUS__ERROR_UNSUPPORTED:
+    res = -ENOSYS;
+    break;
+  case HADOOP__HDFS__STATUS__SUCCESS:
+  case HADOOP__HDFS__STATUS__CHECKSUM_OK:
+    res = 0;
+    break;
+  default:
+    res = -ENOTSUP;
+    break;
+  }
+
+  return res;
+}
+
+int hadoop_rpc_copy_packets(
+  struct connection_state * state,
+  uint8_t * to)
+{
+  int res;
+  uint32_t packetlen;
+  uint16_t headerlen;
+  bool more = true;
+  Hadoop__Hdfs__ClientReadStatusProto ack = HADOOP__HDFS__CLIENT_READ_STATUS_PROTO__INIT;
+  void * buf;
+  uint32_t len;
+
+  while(more)
+  {
+    void * headerbuf;
+    Hadoop__Hdfs__PacketHeaderProto * header;
+
+    res = recvfrom(state->sockfd, &packetlen, sizeof(packetlen), MSG_WAITALL, NULL, NULL);
+    if(res < 0)
+    {
+      return res;
+    }
+    packetlen = ntohl(packetlen);
+
+    res = recvfrom(state->sockfd, &headerlen, sizeof(headerlen), MSG_WAITALL, NULL, NULL);
+    if(res < 0)
+    {
+      return res;
+    }
+    headerlen = ntohs(headerlen);
+
+    headerbuf = alloca(headerlen);
+    res = recvfrom(state->sockfd, headerbuf, headerlen, MSG_WAITALL, NULL, NULL);
+    if(res < 0)
+    {
+      return res;
+    }
+    header = hadoop__hdfs__packet_header_proto__unpack(NULL, headerlen, headerbuf);
+
+    more = !header->lastpacketinblock;
+    res = recvfrom(state->sockfd, to, header->datalen, MSG_WAITALL, NULL, NULL);
+    hadoop__hdfs__packet_header_proto__free_unpacked(header, NULL);
+
+    if(res < 0)
+    {
+      return res;
+    }
+  }
+
+  // ack transfer
+  ack.status = HADOOP__HDFS__STATUS__SUCCESS;
+  PACK(len, buf, &ack);
+  res = hadoop_rpc_send(state, buf, len);
+  if(res < 0)
+  {
+    return res;
+  }
+
+  return 0;
+}
+
