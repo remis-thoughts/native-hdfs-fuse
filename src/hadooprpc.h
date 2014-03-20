@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include "proto/datatransfer.pb-c.h"
 
@@ -14,6 +15,9 @@ struct connection_state {
   int32_t next_call_id;
   struct sockaddr_in servaddr;
   bool isconnected;
+  const char * clientname;
+  pthread_t worker;
+  pthread_mutex_t mutex;
 };
 
 int hadoop_rpc_connect_namenode(
@@ -42,7 +46,7 @@ int hadoop_rpc_call_datanode(
   const ProtobufCMessage * in,
   Hadoop__Hdfs__BlockOpResponseProto ** out);
 
-int hadoop_rpc_copy_packets(
+int hadoop_rpc_receive_packets(
   struct connection_state * state,
   uint8_t * to);
 

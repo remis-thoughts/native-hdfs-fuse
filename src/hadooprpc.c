@@ -4,6 +4,7 @@
 
 #include "proto/IpcConnectionContext.pb-c.h"
 #include "proto/ProtobufRpcEngine.pb-c.h"
+#include "proto/ClientNamenodeProtocol.pb-c.h"
 #include "proto/RpcHeader.pb-c.h"
 #include "proto/datatransfer.pb-c.h"
 
@@ -13,6 +14,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static
+void * hadoop_namenode_worker(void * p)
+{
+  Hadoop__Hdfs__RenewLeaseRequestProto request = HADOOP__HDFS__RENEW_LEASE_REQUEST_PROTO__INIT;
+  Hadoop__Hdfs__RenewLeaseResponseProto * response = NULL;
+  int res;
+  struct connection_state * state = (struct connection_state *) p;
+  request.clientname = (char *) state->clientname;
+
+  while(true)
+  {
+    // "If the client is not actively using the lease, it will time out after one minute (default value)."
+    // http://itm-vm.shidler.hawaii.edu/HDFS/ArchDocDecomposition.html
+    sleep(30);
+
+    res = hadoop_rpc_call_namenode(
+      state,
+      &hadoop__hdfs__client_namenode_protocol__descriptor,
+      "renewLease",
+      (const ProtobufCMessage *) &request,
+      (ProtobufCMessage **) &response);
+    if(res == 0)
+    {
+      hadoop__hdfs__renew_lease_response_proto__free_unpacked(response, NULL);
+    }
+  }
+
+  return NULL;
+}
 
 static inline
 ssize_t hadoop_rpc_send(const struct connection_state * state, const void * const it, const ssize_t len)
@@ -43,36 +74,6 @@ ssize_t hadoop_rpc_send_int32(const struct connection_state * state, const uint3
   } while(0)
 
 int
-hadoop_rpc_send_out_of_band(
-  struct connection_state * state,
-  const void * msgbuf,
-  const uint32_t msglen,
-  const int32_t callid)
-{
-  void * headerbuf;
-  uint32_t headerlen;
-  Hadoop__Common__RpcRequestHeaderProto header = HADOOP__COMMON__RPC_REQUEST_HEADER_PROTO__INIT;
-
-  header.rpckind = HADOOP__COMMON__RPC_KIND_PROTO__RPC_PROTOCOL_BUFFER;
-  header.has_rpckind = true;
-  header.rpcop = HADOOP__COMMON__RPC_REQUEST_HEADER_PROTO__OPERATION_PROTO__RPC_FINAL_PACKET;
-  header.has_rpcop = true;
-  header.callid = callid;
-  PACK(headerlen, headerbuf, &header);
-
-  if(hadoop_rpc_send_int32(state, headerlen + msglen) < 0
-     || hadoop_rpc_send(state, headerbuf, headerlen) < 0
-     || hadoop_rpc_send(state, msgbuf, msglen) < 0)
-  {
-    return -EINVAL;
-  }
-  else
-  {
-    return 0;
-  }
-}
-
-int
 hadoop_rpc_call_namenode(
   struct connection_state * state,
   const ProtobufCServiceDescriptor * service,
@@ -80,6 +81,7 @@ hadoop_rpc_call_namenode(
   const ProtobufCMessage * in,
   ProtobufCMessage ** out)
 {
+  int res;
   void * headerbuf;
   uint32_t headerlen;
   void * requestbuf;
@@ -94,6 +96,8 @@ hadoop_rpc_call_namenode(
   void * msgbuf;
   uint32_t msglen;
   const ProtobufCMethodDescriptor * method = protobuf_c_service_descriptor_get_method_by_name(service, methodname);
+
+  pthread_mutex_lock(&state->mutex);
 
   PACK(msglen, msgbuf, in);
 
@@ -114,15 +118,17 @@ hadoop_rpc_call_namenode(
   hadoop_rpc_send(state, requestbuf, requestlen);
   hadoop_rpc_send(state, msgbuf, msglen);
 
-  if(recvfrom(state->sockfd, &responselen, sizeof(responselen), MSG_WAITALL, NULL, NULL) < 0)
+  res = recvfrom(state->sockfd, &responselen, sizeof(responselen), MSG_WAITALL, NULL, NULL);
+  if(res < 0)
   {
-    return -1;
+    goto cleanup;
   }
   responselen = ntohl(responselen);
   responsebuf = alloca(responselen);
-  if(recvfrom(state->sockfd, responsebuf, responselen, MSG_WAITALL, NULL, NULL) < 0)
+  res = recvfrom(state->sockfd, responsebuf, responselen, MSG_WAITALL, NULL, NULL);
+  if(res < 0)
   {
-    return -1;
+    goto cleanup;
   }
 
   responseheaderlen = decode_unsigned_varint(responsebuf, &lenlen);
@@ -133,58 +139,77 @@ hadoop_rpc_call_namenode(
   switch(response->status)
   {
   case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_STATUS_PROTO__SUCCESS:
-  {
     hadoop__common__rpc_response_header_proto__free_unpacked(response, NULL);
 
     responseheaderlen = decode_unsigned_varint(responsebuf, &lenlen);
     responsebuf += lenlen;
     *out = protobuf_c_message_unpack(method->output, NULL, responseheaderlen, responsebuf);
 
-    return 0;
-  }
+    res = 0;
+    goto cleanup;
   case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_STATUS_PROTO__FATAL:
-  {
-    state->isconnected = false;
-    close(state->sockfd);
-    // fall-through
-  }
+    hadoop_rpc_disconnect(state);
+  // fall-through
   case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_STATUS_PROTO__ERROR:
   default:
-  {
-    const char * error;
-    if(response->errormsg)
+
+    if(response->has_errordetail)
     {
-      error = response->errormsg;
+      switch(response->errordetail)
+      {
+      case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_ERROR_CODE_PROTO__FATAL_UNAUTHORIZED:
+        res = -EACCES;
+        break;
+      case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_ERROR_CODE_PROTO__FATAL_VERSION_MISMATCH:
+      case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_ERROR_CODE_PROTO__ERROR_RPC_VERSION_MISMATCH:
+        res = -ERPCMISMATCH;
+        break;
+      case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_ERROR_CODE_PROTO__FATAL_INVALID_RPC_HEADER:
+      case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_ERROR_CODE_PROTO__ERROR_RPC_SERVER:
+        res = -EBADRPC;
+        break;
+      default:
+        res = -EINVAL;
+        break;
+      }
     }
     else
     {
-      error = "(no msg)";
+      res = -EINVAL;
     }
-    fprintf(stderr, "Error! %s\n", error);
 
     hadoop__common__rpc_response_header_proto__free_unpacked(response, NULL);
-    return -1;
+    goto cleanup;
   }
-  }
+
+cleanup:
+  pthread_mutex_unlock(&state->mutex);
+  return res;
 }
 
 int
 hadoop_rpc_disconnect(struct connection_state * state)
 {
-  int res = close(state->sockfd);
+  close(state->sockfd); // don't care if we fail
   state->isconnected = false;
-  return res;
+  pthread_cancel(state->worker); // don't care if we fail
+  return 0;
 }
 
 int
 hadoop_rpc_connect_namenode(struct connection_state * state, const char * host, const uint16_t port)
 {
-  uint32_t len;
+  int error;
   uint8_t header[] = { 'h', 'r', 'p', 'c', 9, 0, 0};
   Hadoop__Common__IpcConnectionContextProto context = HADOOP__COMMON__IPC_CONNECTION_CONTEXT_PROTO__INIT;
   Hadoop__Common__UserInformationProto userinfo = HADOOP__COMMON__USER_INFORMATION_PROTO__INIT;
-  void * buf;
-  int error;
+  void * contextbuf;
+  uint32_t contextlen;
+  void * rpcheaderbuf;
+  uint32_t rpcheaderlen;
+  Hadoop__Common__RpcRequestHeaderProto rpcheader = HADOOP__COMMON__RPC_REQUEST_HEADER_PROTO__INIT;
+
+  pthread_mutex_lock(&state->mutex);
 
   state->sockfd = socket(AF_INET, SOCK_STREAM, 0);
   state->servaddr.sin_family = AF_INET;
@@ -194,33 +219,55 @@ hadoop_rpc_connect_namenode(struct connection_state * state, const char * host, 
   error = connect(state->sockfd, (struct sockaddr *) &state->servaddr, sizeof(state->servaddr));
   if(error < 0)
   {
-    error = -EHOSTUNREACH;
     goto fail;
   }
 
   error = hadoop_rpc_send(state, &header, sizeof(header));
   if(error < 0)
   {
-    error = -EPROTO;
     goto fail;
   }
 
   userinfo.effectiveuser = getenv("USER");
   context.userinfo = &userinfo;
   context.protocol = "org.apache.hadoop.hdfs.protocol.ClientProtocol";
-  PACK(len, buf, &context);
+  PACK(contextlen, contextbuf, &context);
 
-  error = hadoop_rpc_send_out_of_band(state, buf, len, CONNECTION_CONTEXT_CALL_ID);
+  rpcheader.rpckind = HADOOP__COMMON__RPC_KIND_PROTO__RPC_PROTOCOL_BUFFER;
+  rpcheader.has_rpckind = true;
+  rpcheader.rpcop = HADOOP__COMMON__RPC_REQUEST_HEADER_PROTO__OPERATION_PROTO__RPC_FINAL_PACKET;
+  rpcheader.has_rpcop = true;
+  rpcheader.callid = CONNECTION_CONTEXT_CALL_ID;
+  PACK(rpcheaderlen, rpcheaderbuf, &rpcheader);
+
+  error = hadoop_rpc_send_int32(state, rpcheaderlen + contextlen);
   if(error < 0)
   {
-    error = -EBADRPC;
+    goto fail;
+  }
+  error = hadoop_rpc_send(state, rpcheaderbuf, rpcheaderlen);
+  if(error < 0)
+  {
+    goto fail;
+  }
+  error = hadoop_rpc_send(state, contextbuf, contextlen);
+  if(error < 0)
+  {
+    goto fail;
+  }
+
+  error = pthread_create(&state->worker, NULL, hadoop_namenode_worker, state);
+  if(error < 0)
+  {
     goto fail;
   }
 
   state->isconnected = true;
+  pthread_mutex_unlock(&state->mutex);
   return 0;
 
 fail:
+  pthread_mutex_unlock(&state->mutex);
   hadoop_rpc_disconnect(state);
   return error;
 }
@@ -327,7 +374,7 @@ int hadoop_rpc_call_datanode(
   return res;
 }
 
-int hadoop_rpc_copy_packets(
+int hadoop_rpc_receive_packets(
   struct connection_state * state,
   uint8_t * to)
 {
