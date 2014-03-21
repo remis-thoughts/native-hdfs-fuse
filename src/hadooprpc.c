@@ -58,6 +58,13 @@ ssize_t hadoop_rpc_send_int32(const struct connection_state * state, const uint3
   return sendto(state->sockfd, &it_in_n, sizeof(it_in_n), 0, (struct sockaddr *) &state->servaddr, sizeof(state->servaddr));
 }
 
+static inline
+ssize_t hadoop_rpc_send_int16(const struct connection_state * state, const uint16_t it)
+{
+  uint16_t it_in_n = htons(it);
+  return sendto(state->sockfd, &it_in_n, sizeof(it_in_n), 0, (struct sockaddr *) &state->servaddr, sizeof(state->servaddr));
+}
+
 #define CONNECTION_CONTEXT_CALL_ID -3
 
 #define PACK(len, buf, msg) \
@@ -294,6 +301,41 @@ hadoop_rpc_connect_datanode(struct connection_state * state, const char * host, 
   }
 }
 
+static
+int hadoop_rpc_receive_proto(
+  struct connection_state * state,
+  ProtobufCMessage ** out,
+  ProtobufCMessage * (*unpack)(ProtobufCAllocator  *, size_t, const uint8_t *))
+{
+  int res;
+  uint8_t len_varint[5];
+  uint8_t len_varintlen;
+  uint64_t len;
+  uint8_t bytesinwrongbuf;
+  void * buf;
+
+  res = recvfrom(state->sockfd, &len_varint[0], sizeof(len_varint), MSG_WAITALL, NULL, NULL);
+  if(res < 0)
+  {
+    return res;
+  }
+  len = decode_unsigned_varint(&len_varint[0], &len_varintlen);
+  bytesinwrongbuf = 5 - len_varintlen;
+  buf = alloca(len);
+  if(bytesinwrongbuf > 0)
+  {
+    // copy remaining bytes from buffer
+    memcpy(buf, len_varint + len_varintlen, bytesinwrongbuf);
+  }
+  res = recvfrom(state->sockfd, buf + bytesinwrongbuf, len - bytesinwrongbuf, MSG_WAITALL, NULL, NULL);
+  if(res < 0)
+  {
+    return res;
+  }
+  *out = unpack(NULL, len, buf);
+  return 0;
+}
+
 int hadoop_rpc_call_datanode(
   struct connection_state * state,
   uint8_t type,
@@ -303,12 +345,6 @@ int hadoop_rpc_call_datanode(
   int res;
   void * buf;
   uint32_t len;
-  Hadoop__Hdfs__BlockOpResponseProto * response;
-  uint8_t responselen_varint[5];
-  uint8_t responselen_varintlen;
-  uint64_t responselen;
-  void * responsebuf;
-  uint8_t bytesinwrongbuf;
   uint8_t header[] = { 0, 28, type };
 
   res = hadoop_rpc_send(state, &header, sizeof(header));
@@ -323,26 +359,15 @@ int hadoop_rpc_call_datanode(
     return -EPROTO;
   }
 
-  res = recvfrom(state->sockfd, &responselen_varint[0], sizeof(responselen_varint), MSG_WAITALL, NULL, NULL);
+  res = hadoop_rpc_receive_proto(
+    state,
+    (ProtobufCMessage **) out,
+    (ProtobufCMessage * (*)(ProtobufCAllocator  *, size_t, const uint8_t *))hadoop__hdfs__block_op_response_proto__unpack);
   if(res < 0)
   {
     return res;
   }
-  responselen = decode_unsigned_varint(&responselen_varint[0], &responselen_varintlen);
-  bytesinwrongbuf = 5 - responselen_varintlen;
-  responsebuf = alloca(responselen);
-  if(bytesinwrongbuf > 0)
-  {
-    // copy remaining bytes from buffer
-    memcpy(responsebuf, responselen_varint + responselen_varintlen, bytesinwrongbuf);
-  }
-  res = recvfrom(state->sockfd, responsebuf + bytesinwrongbuf, responselen - bytesinwrongbuf, MSG_WAITALL, NULL, NULL);
-  if(res < 0)
-  {
-    return res;
-  }
-  *out = response = hadoop__hdfs__block_op_response_proto__unpack(NULL, responselen, responsebuf);
-  switch(response->status)
+  switch((*out)->status)
   {
   case HADOOP__HDFS__STATUS__ERROR:
     res = -EINVAL;
@@ -369,6 +394,12 @@ int hadoop_rpc_call_datanode(
   default:
     res = -ENOTSUP;
     break;
+  }
+
+  if(res < 0)
+  {
+    hadoop__hdfs__block_op_response_proto__free_unpacked(*out, NULL);
+    *out = NULL;
   }
 
   return res;
@@ -427,6 +458,165 @@ int hadoop_rpc_receive_packets(
   ack.status = HADOOP__HDFS__STATUS__SUCCESS;
   PACK(len, buf, &ack);
   res = hadoop_rpc_send(state, buf, len);
+  if(res < 0)
+  {
+    return res;
+  }
+
+  return 0;
+}
+
+#define PACKET_SIZE 65535
+
+static
+int hadoop_rpc_send_packet(
+  struct connection_state * state,
+  int64_t seqno,
+  uint8_t * from,
+  size_t len, // bytes from "from" to read
+  off_t offset, // offset in packet
+  Hadoop__Hdfs__ChecksumProto * checksum)
+{
+  // Each packet looks like:
+  //   PLEN    HLEN      HEADER     CHECKSUMS  DATA
+  //   32-bit  16-bit   <protobuf>  <variable length>
+  //
+  // PLEN:      Payload length
+  //            = length(PLEN) + length(CHECKSUMS) + length(DATA)
+  //            This length includes its own encoded length in
+  //            the sum for historical reasons.
+  //
+  // HLEN:      Header length
+  //            = length(HEADER)
+  //
+  // HEADER:    the actual packet header fields, encoded in protobuf
+  // CHECKSUMS: the crcs for the data chunk. May be missing if
+  //            checksums were not requested
+  // DATA       the actual block data
+
+  (void) checksum;
+  int res;
+  uint32_t packetlen;
+  uint16_t headerlen;
+  void * headerbuf;
+  Hadoop__Hdfs__PacketHeaderProto header = HADOOP__HDFS__PACKET_HEADER_PROTO__INIT;
+  Hadoop__Hdfs__PipelineAckProto * ack = NULL;
+
+  assert(len <= PACKET_SIZE);
+
+  header.seqno = seqno;
+  header.offsetinblock = offset;
+  header.lastpacketinblock = len == 0;
+  header.datalen = len;
+  headerlen = hadoop__hdfs__packet_header_proto__get_packed_size(&header);
+  headerbuf = alloca(headerlen);
+  hadoop__hdfs__packet_header_proto__pack(&header, headerbuf);
+  packetlen = sizeof(packetlen) + 0 + header.datalen;
+
+  res = hadoop_rpc_send_int32(state, packetlen);
+  if(res < 0)
+  {
+    return res;
+  }
+  res = hadoop_rpc_send_int16(state, headerlen);
+  if(res < 0)
+  {
+    return res;
+  }
+  res = hadoop_rpc_send(state, headerbuf, headerlen);
+  if(res < 0)
+  {
+    return res;
+  }
+  res = hadoop_rpc_send(state, from, header.datalen);
+  if(res < 0)
+  {
+    return res;
+  }
+
+  // now get the ack
+  res = hadoop_rpc_receive_proto(
+    state,
+    (ProtobufCMessage **) &ack,
+    (ProtobufCMessage * (*)(ProtobufCAllocator  *, size_t, const uint8_t *))hadoop__hdfs__pipeline_ack_proto__unpack);
+  if(res < 0)
+  {
+    goto endpacket;
+  }
+  if(ack->seqno != seqno)
+  {
+    res = -EPROTO;
+    goto endpacket;
+  }
+  if(ack->seqno != header.seqno || ack->n_status == 0)
+  {
+    res = -EPROTO;
+    goto endpacket;
+  }
+
+  for(size_t i = 0; i < ack->n_status; ++i)
+  {
+    switch(ack->status[i])
+    {
+    case HADOOP__HDFS__STATUS__SUCCESS:
+    case HADOOP__HDFS__STATUS__CHECKSUM_OK:
+      res = 0;
+      break;
+    default:
+      res = -EINVAL;
+      goto endpacket;
+    }
+  }
+
+endpacket:
+  if(ack)
+  {
+    hadoop__hdfs__pipeline_ack_proto__free_unpacked(ack, NULL);
+  }
+  return res;
+}
+
+int hadoop_rpc_send_packets(
+  struct connection_state * state,
+  uint8_t * from,
+  size_t len,
+  off_t offset,
+  Hadoop__Hdfs__ChecksumProto * checksum)
+{
+  int res;
+  size_t sent = 0;
+  int64_t seqno = 0;
+
+  while(sent < len)
+  {
+    size_t packetlen = len - sent;
+    if(packetlen > PACKET_SIZE)
+    {
+      packetlen = PACKET_SIZE;
+    }
+    res = hadoop_rpc_send_packet(
+      state,
+      seqno++,
+      from + sent,
+      packetlen,
+      offset + sent,
+      checksum);
+    if(res < 0)
+    {
+      return res;
+    }
+
+    sent += packetlen;
+  }
+
+  // sent empty packet to finish
+  res = hadoop_rpc_send_packet(
+    state,
+    seqno++,
+    from + sent,
+    0,
+    offset + sent,
+    checksum);
   if(res < 0)
   {
     return res;

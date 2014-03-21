@@ -50,4 +50,11 @@ int hadoop_rpc_receive_packets(
   struct connection_state * state,
   uint8_t * to);
 
+int hadoop_rpc_send_packets(
+  struct connection_state * state,
+  uint8_t * from,
+  size_t len,
+  off_t offset,
+  Hadoop__Hdfs__ChecksumProto * checksum);
+
 #endif

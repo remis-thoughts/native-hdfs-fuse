@@ -733,9 +733,6 @@ end:
 static
 int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t offset, struct fuse_file_info * fi)
 {
-  (void) data;
-  (void) len;
-  (void) offset;
   (void) fi;
   int res;
   struct connection_state * state = (struct connection_state *) fuse_get_context()->private_data;
@@ -747,7 +744,7 @@ int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t off
   Hadoop__Hdfs__AddBlockResponseProto * block_response = NULL;
   Hadoop__Hdfs__LocatedBlockProto * block;
   Hadoop__Hdfs__ChecksumProto checksum = HADOOP__HDFS__CHECKSUM_PROTO__INIT;
-
+  uint64_t blocksize = len;
   bool written = false;
 
   block_request.src = (char *) src;
@@ -768,12 +765,19 @@ int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t off
   checksum.type = HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_NULL;
   checksum.bytesperchecksum = 65536;
   clientheader.clientname = (char *) state->clientname;
+  block->b->has_numbytes = true;
+  block->b->numbytes = blocksize;
   baseheader.block = block->b;
+  baseheader.token = block->blocktoken;
   clientheader.baseheader = &baseheader;
   op.header = &clientheader;
-  op.n_targets = block->n_locs;
-  op.targets = block->locs;
+  op.pipelinesize = block->n_locs; // not actually used?
+  op.n_targets = block->n_locs - 1;
+  op.targets = alloca((op.n_targets - 1) * sizeof(Hadoop__Hdfs__DatanodeInfoProto *));
   op.stage = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__BLOCK_CONSTRUCTION_STAGE__PIPELINE_SETUP_CREATE;
+  op.latestgenerationstamp = block->b->generationstamp;
+  op.minbytesrcvd = 0;
+  op.maxbytesrcvd = blocksize;
   op.requestedchecksum = &checksum;
 
   // for now, don't care about which locatoin we get it from
@@ -781,6 +785,14 @@ int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t off
   {
     Hadoop__Hdfs__DatanodeInfoProto * location = block->locs[l];
     struct connection_state dn_state;
+
+    for(uint32_t t_idx = 0, l_idx = 0; l_idx < block->n_locs; ++l_idx)
+    {
+      if(l_idx != l)
+      {
+        op.targets[t_idx++] = block->locs[l_idx];
+      }
+    }
 
     memset(&dn_state, 0, sizeof(dn_state));
     res = hadoop_rpc_connect_datanode(&dn_state, location->id->ipaddr, location->id->xferport);
@@ -797,7 +809,12 @@ int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t off
     }
     hadoop__hdfs__block_op_response_proto__free_unpacked(opresponse, NULL);
 
-    res = 0;
+    res = hadoop_rpc_send_packets(
+      &dn_state,
+      (uint8_t *) data,
+      len,
+      offset,
+      &checksum);
     if(res < 0)
     {
       hadoop_rpc_disconnect(&dn_state);
@@ -812,7 +829,7 @@ int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t off
   hadoop__hdfs__add_block_response_proto__free_unpacked(block_response, NULL);
   if(!written)
   {
-    return -EIO;
+    return res < 0 ? res : -EIO;
   }
 
   return len;
