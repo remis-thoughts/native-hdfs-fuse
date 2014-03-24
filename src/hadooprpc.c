@@ -15,13 +15,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef min
+#define min(a, b) (((a) < (b)) ? (a) : (b))
+#define max(a, b) (((a) > (b)) ? (a) : (b))
+#endif
+
 static
 void * hadoop_namenode_worker(void * p)
 {
   Hadoop__Hdfs__RenewLeaseRequestProto request = HADOOP__HDFS__RENEW_LEASE_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__RenewLeaseResponseProto * response = NULL;
   int res;
-  struct connection_state * state = (struct connection_state *) p;
+  struct namenode_state * state = (struct namenode_state *) p;
   request.clientname = (char *) state->clientname;
 
   while(true)
@@ -31,7 +36,7 @@ void * hadoop_namenode_worker(void * p)
     sleep(30);
 
     res = hadoop_rpc_call_namenode(
-      state,
+      &state->connection,
       &hadoop__hdfs__client_namenode_protocol__descriptor,
       "renewLease",
       (const ProtobufCMessage *) &request,
@@ -80,8 +85,8 @@ ssize_t hadoop_rpc_send_int16(const struct connection_state * state, const uint1
     len += lenlen; \
   } while(0)
 
-int
-hadoop_rpc_call_namenode(
+static inline
+int hadoop_rpc_call_namenode_withlock(
   struct connection_state * state,
   const ProtobufCServiceDescriptor * service,
   const char * methodname,
@@ -103,8 +108,6 @@ hadoop_rpc_call_namenode(
   void * msgbuf;
   uint32_t msglen;
   const ProtobufCMethodDescriptor * method = protobuf_c_service_descriptor_get_method_by_name(service, methodname);
-
-  pthread_mutex_lock(&state->mutex);
 
   PACK(msglen, msgbuf, in);
 
@@ -190,6 +193,21 @@ hadoop_rpc_call_namenode(
   }
 
 cleanup:
+  return res;
+}
+
+int
+hadoop_rpc_call_namenode(
+  struct connection_state * state,
+  const ProtobufCServiceDescriptor * service,
+  const char * methodname,
+  const ProtobufCMessage * in,
+  ProtobufCMessage ** out)
+{
+  int res;
+
+  pthread_mutex_lock(&state->mutex);
+  res = hadoop_rpc_call_namenode(state, service, methodname, in, out);
   pthread_mutex_unlock(&state->mutex);
   return res;
 }
@@ -199,12 +217,11 @@ hadoop_rpc_disconnect(struct connection_state * state)
 {
   close(state->sockfd); // don't care if we fail
   state->isconnected = false;
-  pthread_cancel(state->worker); // don't care if we fail
   return 0;
 }
 
 int
-hadoop_rpc_connect_namenode(struct connection_state * state, const char * host, const uint16_t port)
+hadoop_rpc_connect_namenode(struct namenode_state * state, const char * host, const uint16_t port)
 {
   int error;
   uint8_t header[] = { 'h', 'r', 'p', 'c', 9, 0, 0};
@@ -215,21 +232,24 @@ hadoop_rpc_connect_namenode(struct connection_state * state, const char * host, 
   void * rpcheaderbuf;
   uint32_t rpcheaderlen;
   Hadoop__Common__RpcRequestHeaderProto rpcheader = HADOOP__COMMON__RPC_REQUEST_HEADER_PROTO__INIT;
+  Hadoop__Hdfs__GetServerDefaultsRequestProto defaults_request = HADOOP__HDFS__GET_SERVER_DEFAULTS_REQUEST_PROTO__INIT;
+  Hadoop__Hdfs__GetServerDefaultsResponseProto * defaults_response = NULL;
+  struct connection_state * connection = (struct connection_state *) state;  // struct first element
 
-  pthread_mutex_lock(&state->mutex);
+  pthread_mutex_lock(&connection->mutex);
 
-  state->sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  state->servaddr.sin_family = AF_INET;
-  state->servaddr.sin_addr.s_addr = inet_addr(host);
-  state->servaddr.sin_port = htons(port);
+  connection->sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  connection->servaddr.sin_family = AF_INET;
+  connection->servaddr.sin_addr.s_addr = inet_addr(host);
+  connection->servaddr.sin_port = htons(port);
 
-  error = connect(state->sockfd, (struct sockaddr *) &state->servaddr, sizeof(state->servaddr));
+  error = connect(connection->sockfd, (struct sockaddr *) &connection->servaddr, sizeof(connection->servaddr));
   if(error < 0)
   {
     goto fail;
   }
 
-  error = hadoop_rpc_send(state, &header, sizeof(header));
+  error = hadoop_rpc_send(connection, &header, sizeof(header));
   if(error < 0)
   {
     goto fail;
@@ -247,17 +267,17 @@ hadoop_rpc_connect_namenode(struct connection_state * state, const char * host, 
   rpcheader.callid = CONNECTION_CONTEXT_CALL_ID;
   PACK(rpcheaderlen, rpcheaderbuf, &rpcheader);
 
-  error = hadoop_rpc_send_int32(state, rpcheaderlen + contextlen);
+  error = hadoop_rpc_send_int32(connection, rpcheaderlen + contextlen);
   if(error < 0)
   {
     goto fail;
   }
-  error = hadoop_rpc_send(state, rpcheaderbuf, rpcheaderlen);
+  error = hadoop_rpc_send(connection, rpcheaderbuf, rpcheaderlen);
   if(error < 0)
   {
     goto fail;
   }
-  error = hadoop_rpc_send(state, contextbuf, contextlen);
+  error = hadoop_rpc_send(connection, contextbuf, contextlen);
   if(error < 0)
   {
     goto fail;
@@ -269,13 +289,29 @@ hadoop_rpc_connect_namenode(struct connection_state * state, const char * host, 
     goto fail;
   }
 
-  state->isconnected = true;
-  pthread_mutex_unlock(&state->mutex);
+  error = hadoop_rpc_call_namenode_withlock(
+    connection,
+    &hadoop__hdfs__client_namenode_protocol__descriptor,
+    "getServerDefaults",
+    (const ProtobufCMessage *) &defaults_request,
+    (ProtobufCMessage **) &defaults_response);
+  if(error < 0)
+  {
+    goto fail;
+  }
+  state->packetsize = defaults_response->serverdefaults->writepacketsize;
+  state->blocksize = defaults_response->serverdefaults->blocksize;
+  state->replication = defaults_response->serverdefaults->replication;
+  hadoop__hdfs__get_server_defaults_response_proto__free_unpacked(defaults_response, NULL);
+
+  connection->isconnected = true;
+  pthread_mutex_unlock(&connection->mutex);
   return 0;
 
 fail:
-  pthread_mutex_unlock(&state->mutex);
-  hadoop_rpc_disconnect(state);
+  pthread_mutex_unlock(&connection->mutex);
+  pthread_cancel(state->worker); // don't care if we fail
+  hadoop_rpc_disconnect(connection);
   return error;
 }
 
@@ -373,7 +409,7 @@ int hadoop_rpc_call_datanode(
     res = -EINVAL;
     break;
   case HADOOP__HDFS__STATUS__ERROR_CHECKSUM:
-    res = -EIO;
+    res = -EBADMSG;
     break;
   case HADOOP__HDFS__STATUS__ERROR_INVALID:
     res = -EINVAL;
@@ -407,6 +443,8 @@ int hadoop_rpc_call_datanode(
 
 int hadoop_rpc_receive_packets(
   struct connection_state * state,
+  uint64_t skipbytes, // bytes from first packet to skip due to checksum alignment
+  size_t len,
   uint8_t * to)
 {
   int res;
@@ -414,13 +452,14 @@ int hadoop_rpc_receive_packets(
   uint16_t headerlen;
   bool more = true;
   Hadoop__Hdfs__ClientReadStatusProto ack = HADOOP__HDFS__CLIENT_READ_STATUS_PROTO__INIT;
-  void * buf;
-  uint32_t len;
+  void * ackbuf;
+  uint32_t acklen;
 
-  while(more)
+  while(more && len > 0)
   {
     void * headerbuf;
     Hadoop__Hdfs__PacketHeaderProto * header;
+    size_t available;
 
     res = recvfrom(state->sockfd, &packetlen, sizeof(packetlen), MSG_WAITALL, NULL, NULL);
     if(res < 0)
@@ -444,20 +483,37 @@ int hadoop_rpc_receive_packets(
     }
     header = hadoop__hdfs__packet_header_proto__unpack(NULL, headerlen, headerbuf);
 
+    available = header->datalen;
     more = !header->lastpacketinblock;
-    res = recvfrom(state->sockfd, to, header->datalen, MSG_WAITALL, NULL, NULL);
     hadoop__hdfs__packet_header_proto__free_unpacked(header, NULL);
 
-    if(res < 0)
+    if(skipbytes > 0)
     {
-      return res;
+      ssize_t skipped = min(available, skipbytes);
+      res = recvfrom(state->sockfd, to, skipped, MSG_WAITALL, NULL, NULL);
+      if(res < 0)
+      {
+        return res;
+      }
+      available -= skipped;
+    }
+
+    if(available > 0)
+    {
+      ssize_t read = min(available, len);
+      res = recvfrom(state->sockfd, to, read, MSG_WAITALL, NULL, NULL);
+      if(res < 0)
+      {
+        return res;
+      }
+      len -= read;
     }
   }
 
   // ack transfer
   ack.status = HADOOP__HDFS__STATUS__SUCCESS;
-  PACK(len, buf, &ack);
-  res = hadoop_rpc_send(state, buf, len);
+  PACK(acklen, ackbuf, &ack);
+  res = hadoop_rpc_send(state, ackbuf, acklen);
   if(res < 0)
   {
     return res;
@@ -466,8 +522,6 @@ int hadoop_rpc_receive_packets(
   return 0;
 }
 
-#define PACKET_SIZE 65535
-
 static
 int hadoop_rpc_send_packet(
   struct connection_state * state,
@@ -475,7 +529,7 @@ int hadoop_rpc_send_packet(
   uint8_t * from,
   size_t len, // bytes from "from" to read
   off_t offset, // offset in packet
-  Hadoop__Hdfs__ChecksumProto * checksum)
+  const Hadoop__Hdfs__ChecksumProto * checksum)
 {
   // Each packet looks like:
   //   PLEN    HLEN      HEADER     CHECKSUMS  DATA
@@ -501,8 +555,6 @@ int hadoop_rpc_send_packet(
   void * headerbuf;
   Hadoop__Hdfs__PacketHeaderProto header = HADOOP__HDFS__PACKET_HEADER_PROTO__INIT;
   Hadoop__Hdfs__PipelineAckProto * ack = NULL;
-
-  assert(len <= PACKET_SIZE);
 
   header.seqno = seqno;
   header.offsetinblock = offset;
@@ -541,8 +593,9 @@ int hadoop_rpc_send_packet(
     (ProtobufCMessage * (*)(ProtobufCAllocator  *, size_t, const uint8_t *))hadoop__hdfs__pipeline_ack_proto__unpack);
   if(res < 0)
   {
-    goto endpacket;
+    return res;
   }
+
   if(ack->seqno != seqno)
   {
     res = -EPROTO;
@@ -569,10 +622,7 @@ int hadoop_rpc_send_packet(
   }
 
 endpacket:
-  if(ack)
-  {
-    hadoop__hdfs__pipeline_ack_proto__free_unpacked(ack, NULL);
-  }
+  hadoop__hdfs__pipeline_ack_proto__free_unpacked(ack, NULL);
   return res;
 }
 
@@ -581,7 +631,8 @@ int hadoop_rpc_send_packets(
   uint8_t * from,
   size_t len,
   off_t offset,
-  Hadoop__Hdfs__ChecksumProto * checksum)
+  uint32_t packetsize,
+  const Hadoop__Hdfs__ChecksumProto * checksum)
 {
   int res;
   size_t sent = 0;
@@ -590,9 +641,9 @@ int hadoop_rpc_send_packets(
   while(sent < len)
   {
     size_t packetlen = len - sent;
-    if(packetlen > PACKET_SIZE)
+    if(packetlen > packetsize)
     {
-      packetlen = PACKET_SIZE;
+      packetlen = packetsize;
     }
     res = hadoop_rpc_send_packet(
       state,

@@ -15,13 +15,20 @@ struct connection_state {
   int32_t next_call_id;
   struct sockaddr_in servaddr;
   bool isconnected;
-  const char * clientname;
-  pthread_t worker;
   pthread_mutex_t mutex;
 };
 
+struct namenode_state {
+  struct connection_state connection;
+  const char * clientname;
+  pthread_t worker;
+  uint32_t packetsize;
+  uint64_t blocksize;
+  uint32_t replication;
+};
+
 int hadoop_rpc_connect_namenode(
-  struct connection_state * state,
+  struct namenode_state * state,
   const char * host,
   const uint16_t port);
 
@@ -48,6 +55,8 @@ int hadoop_rpc_call_datanode(
 
 int hadoop_rpc_receive_packets(
   struct connection_state * state,
+  uint64_t skipbytes,
+  size_t len,
   uint8_t * to);
 
 int hadoop_rpc_send_packets(
@@ -55,6 +64,7 @@ int hadoop_rpc_send_packets(
   uint8_t * from,
   size_t len,
   off_t offset,
-  Hadoop__Hdfs__ChecksumProto * checksum);
+  uint32_t packetsize,
+  const Hadoop__Hdfs__ChecksumProto * checksum);
 
 #endif

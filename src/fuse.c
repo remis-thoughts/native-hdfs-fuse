@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <pwd.h>
 #include <grp.h>
+#include <sys/time.h>
 #ifndef NDEBUG
 #include <execinfo.h>
 #include <assert.h>
@@ -46,16 +47,40 @@ static void dump_trace() {
 #define max(a, b) (((a) > (b)) ? (a) : (b))
 #endif
 
+static
+int hadoop_fuse_truncate(const char * path, off_t offset);
+
+static inline
+struct namenode_state * hadoop_fuse_namenode_state()
+{
+  return (struct namenode_state *) fuse_get_context()->private_data;
+}
+
+/**
+ * The connection_state struct is the first member of the namenode_state struct
+ */
+static inline
+struct connection_state * hadoop_fuse_namenode_connection()
+{
+  return (struct connection_state *) fuse_get_context()->private_data;
+}
+
+/*
+ * Not const as protobufs needs a char *.
+ */
+static inline
+char * hadoop_fuse_client_name()
+{
+  return (char *) hadoop_fuse_namenode_state()->clientname;
+}
+
 #define CALL_NN(method, request, response) \
   hadoop_rpc_call_namenode( \
-    (struct connection_state *) fuse_get_context()->private_data, \
+    hadoop_fuse_namenode_connection(), \
     (const ProtobufCServiceDescriptor *) &hadoop__hdfs__client_namenode_protocol__descriptor, \
     method, \
     (const ProtobufCMessage *) &request, \
     (ProtobufCMessage **) &response);
-
-static
-int hadoop_fuse_truncate(const char * path, off_t offset);
 
 static
 void unpack_filestatus(Hadoop__Hdfs__HdfsFileStatusProto * fs, struct stat *stbuf)
@@ -93,8 +118,12 @@ void unpack_filestatus(Hadoop__Hdfs__HdfsFileStatusProto * fs, struct stat *stbu
   {
     stbuf->st_blksize = fs->blocksize;
   }
-  stbuf->st_mtime = fs->modification_time;
-  stbuf->st_atime = fs->access_time;
+  else
+  {
+    stbuf->st_blksize = hadoop_fuse_namenode_state()->blocksize;
+  }
+  stbuf->st_mtime = fs->modification_time / 1000;
+  stbuf->st_atime = fs->access_time / 1000;
 
   owner = getpwnam(fs->owner);
   if(owner)
@@ -296,31 +325,24 @@ static
 int hadoop_fuse_statfs(const char * src, struct statvfs * stat)
 {
   int res;
-  uint64_t block_size;
+  uint64_t blocksize;
   (void) src; // HDFS only supports getPreferredBlockSize for files
   Hadoop__Hdfs__GetFsStatusRequestProto fs_request = HADOOP__HDFS__GET_FS_STATUS_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__GetServerDefaultsRequestProto block_request = HADOOP__HDFS__GET_SERVER_DEFAULTS_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__GetFsStatsResponseProto * fs_response = NULL;
-  Hadoop__Hdfs__GetServerDefaultsResponseProto * block_response = NULL;
 
   res = CALL_NN("getFsStats", fs_request, fs_response);
   if(res < 0)
   {
     return res;
   }
-  res = CALL_NN("getServerDefaults", block_request, block_response);
-  if(res < 0)
-  {
-    return res;
-  }
 
-  stat->f_bsize = stat->f_frsize = block_size = block_response->serverdefaults->blocksize;
-  stat->f_blocks = fs_response->capacity / block_size;
-  stat->f_bfree = stat->f_bavail = fs_response->remaining / block_size;
-  stat->f_namemax = 0xFFFFFFFF; // java String max length
+  blocksize = hadoop_fuse_namenode_state()->blocksize;
+  stat->f_bsize = stat->f_frsize = blocksize;
+  stat->f_blocks = fs_response->capacity / blocksize;
+  stat->f_bfree = stat->f_bavail = fs_response->remaining / blocksize;
+  stat->f_namemax = 0x7FFFFFFF; // java String max length
 
   hadoop__hdfs__get_fs_stats_response_proto__free_unpacked(fs_response, NULL);
-  hadoop__hdfs__get_server_defaults_response_proto__free_unpacked(block_response, NULL);
   return 0;
 }
 
@@ -444,7 +466,7 @@ int hadoop_fuse_fsync(const char * src, int datasync, struct fuse_file_info * fi
   Hadoop__Hdfs__FsyncResponseProto *response = NULL;
 
   request.src = (char *) src;
-  request.client = (char *) ((struct connection_state *) fuse_get_context()->private_data)->clientname;
+  request.client = hadoop_fuse_client_name();
   res = CALL_NN("fsync", request, response);
   if(res < 0)
   {
@@ -457,15 +479,21 @@ int hadoop_fuse_fsync(const char * src, int datasync, struct fuse_file_info * fi
   }
 }
 
-static
-int hadoop_fuse_do_release(const char * src)
+static inline
+int hadoop_fuse_do_release(const char * src, Hadoop__Hdfs__ExtendedBlockProto *last, uint64_t fileid)
 {
   int res;
   Hadoop__Hdfs__CompleteRequestProto request = HADOOP__HDFS__COMPLETE_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__CompleteResponseProto *response = NULL;
 
+  assert(fileid != 0);
+
   request.src = (char *) src;
-  request.clientname = (char *) ((struct connection_state *) fuse_get_context()->private_data)->clientname;
+  request.clientname = hadoop_fuse_client_name();
+  request.has_fileid = true;
+  request.fileid = fileid;
+  request.last = last;
+
   res = CALL_NN("complete", request, response);
   if(res < 0)
   {
@@ -482,9 +510,9 @@ int hadoop_fuse_do_release(const char * src)
 static
 int hadoop_fuse_release(const char * src, struct fuse_file_info * fi)
 {
-  if(fi->flags & (O_WRONLY | O_RDWR))
+  if((fi->flags & O_ACCMODE) != O_RDONLY)
   {
-    return hadoop_fuse_do_release(src);
+    return hadoop_fuse_do_release(src, NULL, fi->fh);
   }
   else
   {
@@ -513,7 +541,7 @@ int hadoop_fuse_mknod(const char * src, mode_t perm, dev_t dev)
   }
 
   request.src = (char *) src;
-  request.clientname = (char *) ((struct connection_state *) fuse_get_context()->private_data)->clientname;
+  request.clientname = hadoop_fuse_client_name();
   request.createparent = false;
   request.masked = &permission;
   permission.perm = perm;
@@ -528,10 +556,20 @@ int hadoop_fuse_mknod(const char * src, mode_t perm, dev_t dev)
   {
     return res;
   }
+  if(!response->fs || !response->fs->has_fileid)
+  {
+    return -EPROTO;
+  }
 
+  // release our lease on this file
+  res = hadoop_fuse_do_release(src, NULL, response->fs->fileid);
   hadoop__hdfs__create_response_proto__free_unpacked(response, NULL);
+  if(res < 0)
+  {
+    return res;
+  }
 
-  return hadoop_fuse_do_release(src); // release our lease on this file
+  return 0;
 }
 
 static
@@ -541,7 +579,7 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
   Hadoop__Hdfs__GetFileInfoRequestProto file_request = HADOOP__HDFS__GET_FILE_INFO_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__GetFileInfoResponseProto *file_response = NULL;
   Hadoop__Hdfs__FsPermissionProto permission = HADOOP__HDFS__FS_PERMISSION_PROTO__INIT;
-  bool exists;
+  uint64_t fileid; // of the existing file, or 0
 
   file_request.src = (char *) path;
   res = CALL_NN("getFileInfo", file_request, file_response);
@@ -549,10 +587,10 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
   {
     return res;
   }
-  exists = file_response->fs;
 
-  if(exists)
+  if(file_response->fs && file_response->fs->has_fileid)
   {
+    fileid = file_response->fs->fileid;
     permission.perm = file_response->fs->permission->perm;
     hadoop__hdfs__get_file_info_response_proto__free_unpacked(file_response, NULL);
 
@@ -568,6 +606,7 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
     if(fi->flags & O_CREAT)
     {
       permission.perm = 0755; // defaults
+      fileid = 0;
     }
     else
     {
@@ -581,14 +620,14 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
     // we need the lease on this file
     bool truncate = (fi->flags & O_TRUNC) == O_TRUNC;
 
-    if(exists && !truncate)
+    if(fileid && !truncate)
     {
       // hadoop sementics means we must "append"
       Hadoop__Hdfs__AppendRequestProto request = HADOOP__HDFS__APPEND_REQUEST_PROTO__INIT;
       Hadoop__Hdfs__AppendResponseProto *response = NULL;
 
       request.src = (char *) path;
-      request.clientname = (char *) ((struct connection_state *) fuse_get_context()->private_data)->clientname;
+      request.clientname = hadoop_fuse_client_name();
 
       res = CALL_NN("append", request, response);
       if(res < 0)
@@ -596,25 +635,17 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
         return res;
       }
 
+      fi->fh = fileid;
       hadoop__hdfs__append_response_proto__free_unpacked(response, NULL);
     }
     else
     {
       // "create" a new file
-      Hadoop__Hdfs__GetServerDefaultsRequestProto defaults_request = HADOOP__HDFS__GET_SERVER_DEFAULTS_REQUEST_PROTO__INIT;
-      Hadoop__Hdfs__GetServerDefaultsResponseProto * defaults_response = NULL;
       Hadoop__Hdfs__CreateRequestProto request = HADOOP__HDFS__CREATE_REQUEST_PROTO__INIT;
       Hadoop__Hdfs__CreateResponseProto *response = NULL;
 
-      // just use default block size & replication factors
-      res = CALL_NN("getServerDefaults", defaults_request, defaults_response);
-      if(res < 0)
-      {
-        return res;
-      }
-
       request.src = (char *) path;
-      request.clientname = (char *) ((struct connection_state *) fuse_get_context()->private_data)->clientname;
+      request.clientname = hadoop_fuse_client_name();
       request.createparent = false;
       request.masked = &permission;
       if(truncate)
@@ -625,9 +656,8 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
       {
         request.createflag = HADOOP__HDFS__CREATE_FLAG_PROTO__CREATE | HADOOP__HDFS__CREATE_FLAG_PROTO__APPEND;
       }
-      request.replication = defaults_response->serverdefaults->replication;
-      request.blocksize = defaults_response->serverdefaults->blocksize;
-      hadoop__hdfs__get_server_defaults_response_proto__free_unpacked(defaults_response, NULL);
+      request.replication = hadoop_fuse_namenode_state()->replication;
+      request.blocksize = hadoop_fuse_namenode_state()->blocksize;
 
       res = CALL_NN("create", request, response);
       if(res < 0)
@@ -635,6 +665,7 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
         return res;
       }
 
+      fi->fh = response->fs->fileid;
       hadoop__hdfs__create_response_proto__free_unpacked(response, NULL);
     }
 
@@ -659,7 +690,6 @@ int hadoop_fuse_truncate(const char * path, off_t offset)
   Hadoop__Hdfs__GetFileInfoResponseProto *file_response = NULL;
   Hadoop__Hdfs__GetBlockLocationsResponseProto *location_response = NULL;
   Hadoop__Hdfs__LocatedBlocksProto * locations;
-  struct connection_state * state = (struct connection_state *) fuse_get_context()->private_data;
 
   if(offset != 0)
   {
@@ -705,7 +735,7 @@ int hadoop_fuse_truncate(const char * path, off_t offset)
     Hadoop__Hdfs__AbandonBlockResponseProto * abandon_response = NULL;
 
     abandon_request.src = (char *) path;
-    abandon_request.holder = (char *) state->clientname;
+    abandon_request.holder = hadoop_fuse_client_name();
     abandon_request.b = locations->blocks[b]->b;
 
     res = CALL_NN("abandonBlock", abandon_request, abandon_response);
@@ -731,66 +761,74 @@ end:
 }
 
 static
-int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t offset, struct fuse_file_info * fi)
+int hadoop_fuse_write_block(
+  const char * src,
+  const char * data,
+  size_t len, // len of data
+  off_t offset, // offset in block
+  const Hadoop__Hdfs__ChecksumProto * checksum,
+  const Hadoop__Hdfs__LocatedBlockProto * block)
 {
-  (void) fi;
   int res;
-  struct connection_state * state = (struct connection_state *) fuse_get_context()->private_data;
+  Hadoop__Hdfs__GetPreferredBlockSizeRequestProto sizerequest = HADOOP__HDFS__GET_PREFERRED_BLOCK_SIZE_REQUEST_PROTO__INIT;
+  Hadoop__Hdfs__GetPreferredBlockSizeResponseProto * sizeresponse = NULL;
   Hadoop__Hdfs__ClientOperationHeaderProto clientheader = HADOOP__HDFS__CLIENT_OPERATION_HEADER_PROTO__INIT;
   Hadoop__Hdfs__BaseHeaderProto baseheader = HADOOP__HDFS__BASE_HEADER_PROTO__INIT;
-  Hadoop__Hdfs__OpWriteBlockProto op = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__INIT;
+  Hadoop__Hdfs__OpWriteBlockProto oprequest = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__INIT;
   Hadoop__Hdfs__BlockOpResponseProto * opresponse = NULL;
-  Hadoop__Hdfs__AddBlockRequestProto block_request = HADOOP__HDFS__ADD_BLOCK_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__AddBlockResponseProto * block_response = NULL;
-  Hadoop__Hdfs__LocatedBlockProto * block;
-  Hadoop__Hdfs__ChecksumProto checksum = HADOOP__HDFS__CHECKSUM_PROTO__INIT;
-  uint64_t blocksize = len;
+  uint64_t actuallen;
+  uint64_t maxblocksize;
   bool written = false;
 
-  block_request.src = (char *) src;
-  block_request.clientname = (char *) state->clientname;
-  block_request.previous = NULL;
-  block_request.has_fileid = false;
-  block_request.n_excludenodes = 0;
-  block_request.n_favorednodes = 0;
-  res = CALL_NN("addBlock", block_request, block_response);
+  sizerequest.filename = (char *) src;
+  res = CALL_NN("getPreferredBlockSize", sizerequest, sizeresponse);
   if(res < 0)
   {
     return res;
   }
-  block = block_response->block;
+  maxblocksize = sizeresponse->bsize;
+  hadoop__hdfs__get_preferred_block_size_response_proto__free_unpacked(sizeresponse, NULL);
 
-  // find a DN to write it to. Assume it fits in one block for now.
+  if(len < maxblocksize - offset)
+  {
+    actuallen = len;
+  }
+  else
+  {
+    actuallen = maxblocksize - offset;
+  }
 
-  checksum.type = HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_NULL;
-  checksum.bytesperchecksum = 65536;
-  clientheader.clientname = (char *) state->clientname;
-  block->b->has_numbytes = true;
-  block->b->numbytes = blocksize;
+  clientheader.clientname = hadoop_fuse_client_name();
   baseheader.block = block->b;
   baseheader.token = block->blocktoken;
   clientheader.baseheader = &baseheader;
-  op.header = &clientheader;
-  op.pipelinesize = block->n_locs; // not actually used?
-  op.n_targets = block->n_locs - 1;
-  op.targets = alloca((op.n_targets - 1) * sizeof(Hadoop__Hdfs__DatanodeInfoProto *));
-  op.stage = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__BLOCK_CONSTRUCTION_STAGE__PIPELINE_SETUP_CREATE;
-  op.latestgenerationstamp = block->b->generationstamp;
-  op.minbytesrcvd = 0;
-  op.maxbytesrcvd = blocksize;
-  op.requestedchecksum = &checksum;
+  oprequest.header = &clientheader;
+  oprequest.pipelinesize = block->n_locs; // not actually used?
+  oprequest.stage = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__BLOCK_CONSTRUCTION_STAGE__PIPELINE_SETUP_CREATE;
+  oprequest.latestgenerationstamp = block->b->generationstamp;
+  oprequest.minbytesrcvd = actuallen;
+  oprequest.maxbytesrcvd = maxblocksize;
+  oprequest.requestedchecksum = (Hadoop__Hdfs__ChecksumProto *) checksum;
 
-  // for now, don't care about which locatoin we get it from
-  for (size_t l = 0; l < block->n_locs; ++l)
+  // targets are the other DNs in the pipeline that the DN we send our block
+  // to will mirror the block to. Clearly this can't include the DN we're sending
+  // to, as that would create a loop!
+  oprequest.n_targets = block->n_locs - 1;
+  oprequest.targets = alloca(oprequest.n_targets * sizeof(Hadoop__Hdfs__DatanodeInfoProto *));
+
+  // for now, don't care about which location we send to, but we should probably
+  // choose the "closest".
+  for (size_t l = 0; l < block->n_locs && !written; ++l)
   {
     Hadoop__Hdfs__DatanodeInfoProto * location = block->locs[l];
     struct connection_state dn_state;
 
+    // build the target list without this location
     for(uint32_t t_idx = 0, l_idx = 0; l_idx < block->n_locs; ++l_idx)
     {
       if(l_idx != l)
       {
-        op.targets[t_idx++] = block->locs[l_idx];
+        oprequest.targets[t_idx++] = block->locs[l_idx];
       }
     }
 
@@ -801,7 +839,7 @@ int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t off
       continue;
     }
 
-    res = hadoop_rpc_call_datanode(&dn_state, 80, (const ProtobufCMessage *) &op, &opresponse);
+    res = hadoop_rpc_call_datanode(&dn_state, 80, (const ProtobufCMessage *) &oprequest, &opresponse);
     if(res < 0)
     {
       hadoop_rpc_disconnect(&dn_state);
@@ -812,24 +850,62 @@ int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t off
     res = hadoop_rpc_send_packets(
       &dn_state,
       (uint8_t *) data,
-      len,
+      actuallen,
       offset,
-      &checksum);
-    if(res < 0)
-    {
-      hadoop_rpc_disconnect(&dn_state);
-      continue;
-    }
+      hadoop_fuse_namenode_state()->packetsize,
+      checksum);
 
-    written = true;
+    written = res == 0;
     hadoop_rpc_disconnect(&dn_state);
-    break;
   }
 
-  hadoop__hdfs__add_block_response_proto__free_unpacked(block_response, NULL);
-  if(!written)
+  if(written)
   {
+    return actuallen;
+  }
+  else
+  {
+    // ensure we return a sensible error code
     return res < 0 ? res : -EIO;
+  }
+}
+
+static
+int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t offset, struct fuse_file_info * fi)
+{
+  int res;
+  Hadoop__Hdfs__AddBlockRequestProto block_request = HADOOP__HDFS__ADD_BLOCK_REQUEST_PROTO__INIT;
+  Hadoop__Hdfs__AddBlockResponseProto * block_response = NULL;
+  Hadoop__Hdfs__ChecksumProto checksum = HADOOP__HDFS__CHECKSUM_PROTO__INIT;
+
+  assert(fi->fh != 0);
+
+  checksum.type = HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_NULL;
+  checksum.bytesperchecksum = 65536;
+
+  block_request.src = (char *) src;
+  block_request.clientname = hadoop_fuse_client_name();
+  block_request.previous = NULL;
+  block_request.has_fileid = true;
+  block_request.fileid = fi->fh;
+  block_request.n_excludenodes = 0;
+  block_request.n_favorednodes = 0;
+  res = CALL_NN("addBlock", block_request, block_response);
+  if(res < 0)
+  {
+    return res;
+  }
+  res = hadoop_fuse_write_block(
+    src,
+    data,
+    len,
+    offset - block_response->block->offset,
+    &checksum,
+    block_response->block);
+  hadoop__hdfs__add_block_response_proto__free_unpacked(block_response, NULL);
+  if(res < 0)
+  {
+    return res;
   }
 
   return len;
@@ -869,9 +945,8 @@ int hadoop_fuse_read(const char * src, char * buf, size_t size, off_t offset, st
       Hadoop__Hdfs__ClientOperationHeaderProto clientheader = HADOOP__HDFS__CLIENT_OPERATION_HEADER_PROTO__INIT;
       Hadoop__Hdfs__BaseHeaderProto baseheader = HADOOP__HDFS__BASE_HEADER_PROTO__INIT;
       Hadoop__Hdfs__OpReadBlockProto op = HADOOP__HDFS__OP_READ_BLOCK_PROTO__INIT;
-      struct connection_state * state = (struct connection_state *) fuse_get_context()->private_data;
 
-      clientheader.clientname = (char *) state->clientname;
+      clientheader.clientname = hadoop_fuse_client_name();
 
       for (size_t b = 0; b < locations->n_blocks; ++b)
       {
@@ -891,14 +966,15 @@ int hadoop_fuse_read(const char * src, char * buf, size_t size, off_t offset, st
           op.header = &clientheader;
           op.has_sendchecksums = true;
           op.sendchecksums = false;
-          op.offset = min(offset - block->offset, 0);
+          op.offset = min(offset - block->offset, 0); // offset into file -> offset into block
           op.len = min(block->b->numbytes - op.offset, size);
 
-          // for now, don't care about which locatoin we get it from
+          // for now, don't care about which location we get it from
           for (size_t l = 0; l < block->n_locs; ++l)
           {
             Hadoop__Hdfs__DatanodeInfoProto * location = block->locs[l];
             struct connection_state dn_state;
+            uint64_t skipbytes;
 
             memset(&dn_state, 0, sizeof(dn_state));
             res = hadoop_rpc_connect_datanode(&dn_state, location->id->ipaddr, location->id->xferport);
@@ -913,10 +989,20 @@ int hadoop_fuse_read(const char * src, char * buf, size_t size, off_t offset, st
               hadoop_rpc_disconnect(&dn_state);
               continue;
             }
+            if(opresponse->readopchecksuminfo)
+            {
+              skipbytes =  op.offset - opresponse->readopchecksuminfo->chunkoffset;
+            }
+            else
+            {
+              skipbytes = 0;
+            }
             hadoop__hdfs__block_op_response_proto__free_unpacked(opresponse, NULL);
 
             res = hadoop_rpc_receive_packets(
               &dn_state,
+              skipbytes,
+              op.len,
               (uint8_t *) buf);
             if(res < 0)
             {
@@ -978,13 +1064,13 @@ struct fuse_operations hello_oper = {
 
 int main(int argc, char *argv[])
 {
-  struct connection_state state;
+  struct namenode_state state;
   uint16_t port;
   int result;
 
   if (argc < 3)
   {
-    fprintf(stderr, "need namenode host & namenode port as first two argumnets\n");
+    fprintf(stderr, "need namenode host & namenode port as first two arguments\n");
     return 1;
   }
 
@@ -995,7 +1081,7 @@ int main(int argc, char *argv[])
   port = atoi(argv[2]);
   memset(&state, 0, sizeof(state));
   state.clientname = "hadoop_fuse";
-  pthread_mutex_init(&state.mutex, NULL);
+  pthread_mutex_init(&state.connection.mutex, NULL);
   result = hadoop_rpc_connect_namenode(&state, argv[1], port);
   if(result < 0)
   {
