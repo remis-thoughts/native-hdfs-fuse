@@ -41,7 +41,7 @@ int hadoop_rpc_disconnect(
   struct connection_state * state);
 
 int hadoop_rpc_call_namenode(
-  struct connection_state * state,
+  struct namenode_state * state,
   const ProtobufCServiceDescriptor * service,
   const char * methodname,
   const ProtobufCMessage * in,

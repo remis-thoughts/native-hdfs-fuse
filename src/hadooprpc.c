@@ -20,6 +20,15 @@
 #define max(a, b) (((a) > (b)) ? (a) : (b))
 #endif
 
+// DECLARATIONS ----------------------------------------------
+
+int hadoop_rpc_disconnect(struct connection_state * state);
+
+static
+int hadoop_rpc_disconnect_namenode(struct namenode_state * state);
+
+// ----------------------------------------------
+
 static
 void * hadoop_namenode_worker(void * p)
 {
@@ -36,7 +45,7 @@ void * hadoop_namenode_worker(void * p)
     sleep(30);
 
     res = hadoop_rpc_call_namenode(
-      &state->connection,
+      state,
       &hadoop__hdfs__client_namenode_protocol__descriptor,
       "renewLease",
       (const ProtobufCMessage *) &request,
@@ -87,7 +96,7 @@ ssize_t hadoop_rpc_send_int16(const struct connection_state * state, const uint1
 
 static inline
 int hadoop_rpc_call_namenode_withlock(
-  struct connection_state * state,
+  struct namenode_state * state,
   const ProtobufCServiceDescriptor * service,
   const char * methodname,
   const ProtobufCMessage * in,
@@ -108,6 +117,7 @@ int hadoop_rpc_call_namenode_withlock(
   void * msgbuf;
   uint32_t msglen;
   const ProtobufCMethodDescriptor * method = protobuf_c_service_descriptor_get_method_by_name(service, methodname);
+  struct connection_state * connection = (struct connection_state *) state;  // struct first element
 
   PACK(msglen, msgbuf, in);
 
@@ -115,7 +125,7 @@ int hadoop_rpc_call_namenode_withlock(
   header.has_rpckind = true;
   header.rpcop = HADOOP__COMMON__RPC_REQUEST_HEADER_PROTO__OPERATION_PROTO__RPC_FINAL_PACKET;
   header.has_rpcop = true;
-  header.callid = state->next_call_id++;
+  header.callid = connection->next_call_id++;
   PACK(headerlen, headerbuf, &header);
 
   request.declaringclassprotocolname = "org.apache.hadoop.hdfs.protocol.ClientProtocol";
@@ -123,19 +133,19 @@ int hadoop_rpc_call_namenode_withlock(
   request.methodname = (char *) methodname;
   PACK(requestlen, requestbuf, &request);
 
-  hadoop_rpc_send_int32(state, headerlen + requestlen + msglen);
-  hadoop_rpc_send(state, headerbuf, headerlen);
-  hadoop_rpc_send(state, requestbuf, requestlen);
-  hadoop_rpc_send(state, msgbuf, msglen);
+  hadoop_rpc_send_int32(connection, headerlen + requestlen + msglen);
+  hadoop_rpc_send(connection, headerbuf, headerlen);
+  hadoop_rpc_send(connection, requestbuf, requestlen);
+  hadoop_rpc_send(connection, msgbuf, msglen);
 
-  res = recvfrom(state->sockfd, &responselen, sizeof(responselen), MSG_WAITALL, NULL, NULL);
+  res = recvfrom(connection->sockfd, &responselen, sizeof(responselen), MSG_WAITALL, NULL, NULL);
   if(res < 0)
   {
     goto cleanup;
   }
   responselen = ntohl(responselen);
   responsebuf = alloca(responselen);
-  res = recvfrom(state->sockfd, responsebuf, responselen, MSG_WAITALL, NULL, NULL);
+  res = recvfrom(connection->sockfd, responsebuf, responselen, MSG_WAITALL, NULL, NULL);
   if(res < 0)
   {
     goto cleanup;
@@ -158,7 +168,7 @@ int hadoop_rpc_call_namenode_withlock(
     res = 0;
     goto cleanup;
   case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_STATUS_PROTO__FATAL:
-    hadoop_rpc_disconnect(state);
+    hadoop_rpc_disconnect_namenode(state);
   // fall-through
   case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_STATUS_PROTO__ERROR:
   default:
@@ -198,25 +208,33 @@ cleanup:
 
 int
 hadoop_rpc_call_namenode(
-  struct connection_state * state,
+  struct namenode_state * state,
   const ProtobufCServiceDescriptor * service,
   const char * methodname,
   const ProtobufCMessage * in,
   ProtobufCMessage ** out)
 {
   int res;
+  struct connection_state * connection = (struct connection_state *) state;  // struct first element
 
-  pthread_mutex_lock(&state->mutex);
+  pthread_mutex_lock(&connection->mutex);
   res = hadoop_rpc_call_namenode(state, service, methodname, in, out);
-  pthread_mutex_unlock(&state->mutex);
+  pthread_mutex_unlock(&connection->mutex);
   return res;
 }
 
-int
-hadoop_rpc_disconnect(struct connection_state * state)
+int hadoop_rpc_disconnect(struct connection_state * state)
 {
   close(state->sockfd); // don't care if we fail
   state->isconnected = false;
+  return 0;
+}
+
+static
+int hadoop_rpc_disconnect_namenode(struct namenode_state * state)
+{
+  hadoop_rpc_disconnect((struct connection_state *) state);
+  pthread_cancel(state->worker); // don't care if we fail
   return 0;
 }
 
@@ -290,7 +308,7 @@ hadoop_rpc_connect_namenode(struct namenode_state * state, const char * host, co
   }
 
   error = hadoop_rpc_call_namenode_withlock(
-    connection,
+    state,
     &hadoop__hdfs__client_namenode_protocol__descriptor,
     "getServerDefaults",
     (const ProtobufCMessage *) &defaults_request,
@@ -310,8 +328,7 @@ hadoop_rpc_connect_namenode(struct namenode_state * state, const char * host, co
 
 fail:
   pthread_mutex_unlock(&connection->mutex);
-  pthread_cancel(state->worker); // don't care if we fail
-  hadoop_rpc_disconnect(connection);
+  hadoop_rpc_disconnect_namenode(state);
   return error;
 }
 

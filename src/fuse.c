@@ -56,15 +56,6 @@ struct namenode_state * hadoop_fuse_namenode_state()
   return (struct namenode_state *) fuse_get_context()->private_data;
 }
 
-/**
- * The connection_state struct is the first member of the namenode_state struct
- */
-static inline
-struct connection_state * hadoop_fuse_namenode_connection()
-{
-  return (struct connection_state *) fuse_get_context()->private_data;
-}
-
 /*
  * Not const as protobufs needs a char *.
  */
@@ -76,7 +67,7 @@ char * hadoop_fuse_client_name()
 
 #define CALL_NN(method, request, response) \
   hadoop_rpc_call_namenode( \
-    hadoop_fuse_namenode_connection(), \
+    hadoop_fuse_namenode_state(), \
     (const ProtobufCServiceDescriptor *) &hadoop__hdfs__client_namenode_protocol__descriptor, \
     method, \
     (const ProtobufCMessage *) &request, \
