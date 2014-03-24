@@ -30,6 +30,7 @@
 #include "proto/ClientNamenodeProtocol.pb-c.h"
 #include "proto/datatransfer.pb-c.h"
 #include "hadooprpc.h"
+#include "minmax.h"
 
 #ifndef NDEBUG
 static void dump_trace() {
@@ -42,13 +43,15 @@ static void dump_trace() {
 
 #endif
 
-#ifndef min
-#define min(a, b) (((a) < (b)) ? (a) : (b))
-#define max(a, b) (((a) > (b)) ? (a) : (b))
-#endif
+// DECLARATIONS ----------------------------------------------
 
 static
 int hadoop_fuse_truncate(const char * path, off_t offset);
+
+static
+int hadoop_fuse_write(const char * src, const char * data, size_t len, off_t offset, struct fuse_file_info * fi);
+
+// -----------------------------------------------------------
 
 static inline
 struct namenode_state * hadoop_fuse_namenode_state()
@@ -68,13 +71,12 @@ char * hadoop_fuse_client_name()
 #define CALL_NN(method, request, response) \
   hadoop_rpc_call_namenode( \
     hadoop_fuse_namenode_state(), \
-    (const ProtobufCServiceDescriptor *) &hadoop__hdfs__client_namenode_protocol__descriptor, \
     method, \
     (const ProtobufCMessage *) &request, \
     (ProtobufCMessage **) &response);
 
 static
-void unpack_filestatus(Hadoop__Hdfs__HdfsFileStatusProto * fs, struct stat *stbuf)
+void unpack_filestatus(Hadoop__Hdfs__HdfsFileStatusProto * fs, struct stat * stbuf)
 {
   struct passwd * owner;
   struct group * group;
@@ -129,11 +131,11 @@ void unpack_filestatus(Hadoop__Hdfs__HdfsFileStatusProto * fs, struct stat *stbu
 }
 
 static
-int hadoop_fuse_getattr(const char *path, struct stat *stbuf)
+int hadoop_fuse_getattr(const char * path, struct stat * stbuf)
 {
   int res;
   Hadoop__Hdfs__GetFileInfoRequestProto request = HADOOP__HDFS__GET_FILE_INFO_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__GetFileInfoResponseProto *response = NULL;
+  Hadoop__Hdfs__GetFileInfoResponseProto * response = NULL;
 
   memset(stbuf, 0, sizeof(struct stat));
 
@@ -161,7 +163,7 @@ int hadoop_fuse_readlink(const char * path, char * buf, size_t len)
 {
   int res;
   Hadoop__Hdfs__GetLinkTargetRequestProto request = HADOOP__HDFS__GET_LINK_TARGET_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__GetLinkTargetResponseProto *response = NULL;
+  Hadoop__Hdfs__GetLinkTargetResponseProto * response = NULL;
 
   request.path = (char *) path;
   res = CALL_NN("getLinkTarget", request, response);
@@ -188,7 +190,7 @@ int hadoop_fuse_utimens(const char * src, const struct timespec tv[2])
 {
   int res;
   Hadoop__Hdfs__SetTimesRequestProto request = HADOOP__HDFS__SET_TIMES_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__SetTimesResponseProto *response = NULL;
+  Hadoop__Hdfs__SetTimesResponseProto * response = NULL;
 
   request.src = (char *) src;
   request.atime = tv[0].tv_sec * 1000 + tv[0].tv_nsec / 1000000;
@@ -212,7 +214,7 @@ int hadoop_fuse_chown(const char * src, uid_t uid, gid_t gid)
   struct passwd * owner;
   struct group * group;
   Hadoop__Hdfs__SetOwnerRequestProto request = HADOOP__HDFS__SET_OWNER_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__SetOwnerResponseProto *response = NULL;
+  Hadoop__Hdfs__SetOwnerResponseProto * response = NULL;
 
   request.src = (char *) src;
   owner = getpwuid(uid);
@@ -244,7 +246,7 @@ int hadoop_fuse_symlink(const char * target, const char * link)
   int res;
   Hadoop__Hdfs__CreateSymlinkRequestProto request = HADOOP__HDFS__CREATE_SYMLINK_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__FsPermissionProto permission = HADOOP__HDFS__FS_PERMISSION_PROTO__INIT;
-  Hadoop__Hdfs__CreateSymlinkResponseProto *response = NULL;
+  Hadoop__Hdfs__CreateSymlinkResponseProto * response = NULL;
 
   request.link = (char *) link;
   request.target = (char *) target;
@@ -268,7 +270,7 @@ int hadoop_fuse_rename(const char * src, const char * dst)
 {
   int res;
   Hadoop__Hdfs__RenameRequestProto request = HADOOP__HDFS__RENAME_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__RenameResponseProto *response = NULL;
+  Hadoop__Hdfs__RenameResponseProto * response = NULL;
 
   request.src = (char *) src;
   request.dst = (char *) dst;
@@ -295,7 +297,7 @@ int hadoop_fuse_chmod(const char * src, mode_t perm)
   int res;
   Hadoop__Hdfs__SetPermissionRequestProto request = HADOOP__HDFS__SET_PERMISSION_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__FsPermissionProto permission = HADOOP__HDFS__FS_PERMISSION_PROTO__INIT;
-  Hadoop__Hdfs__SetPermissionResponseProto *response = NULL;
+  Hadoop__Hdfs__SetPermissionResponseProto * response = NULL;
 
   request.src = (char *) src;
   request.permission = &permission;
@@ -342,7 +344,7 @@ int hadoop_fuse_delete(const char * src)
 {
   int res;
   Hadoop__Hdfs__DeleteRequestProto request = HADOOP__HDFS__DELETE_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__DeleteResponseProto *response = NULL;
+  Hadoop__Hdfs__DeleteResponseProto * response = NULL;
 
   request.src = (char *) src;
   request.recursive = false;
@@ -369,7 +371,7 @@ int hadoop_fuse_mkdir(const char * src, mode_t perm)
   int res;
   Hadoop__Hdfs__MkdirsRequestProto request = HADOOP__HDFS__MKDIRS_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__FsPermissionProto permission = HADOOP__HDFS__FS_PERMISSION_PROTO__INIT;
-  Hadoop__Hdfs__MkdirsResponseProto *response = NULL;
+  Hadoop__Hdfs__MkdirsResponseProto * response = NULL;
 
   request.src = (char *) src;
   request.masked = &permission;
@@ -393,13 +395,13 @@ int hadoop_fuse_mkdir(const char * src, mode_t perm)
 }
 
 static
-int hadoop_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
+int hadoop_fuse_readdir(const char * path, void * buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info * fi)
 {
   (void) offset;
   (void) fi;
   int res;
   Hadoop__Hdfs__GetListingRequestProto request = HADOOP__HDFS__GET_LISTING_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__GetListingResponseProto *response = NULL;
+  Hadoop__Hdfs__GetListingResponseProto * response = NULL;
 
   request.src = (char *) path;
   request.startafter.len = 0;
@@ -454,7 +456,7 @@ int hadoop_fuse_fsync(const char * src, int datasync, struct fuse_file_info * fi
   (void) fi;
   int res;
   Hadoop__Hdfs__FsyncRequestProto request = HADOOP__HDFS__FSYNC_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__FsyncResponseProto *response = NULL;
+  Hadoop__Hdfs__FsyncResponseProto * response = NULL;
 
   request.src = (char *) src;
   request.client = hadoop_fuse_client_name();
@@ -471,11 +473,11 @@ int hadoop_fuse_fsync(const char * src, int datasync, struct fuse_file_info * fi
 }
 
 static inline
-int hadoop_fuse_do_release(const char * src, Hadoop__Hdfs__ExtendedBlockProto *last, uint64_t fileid)
+int hadoop_fuse_do_release(const char * src, Hadoop__Hdfs__ExtendedBlockProto * last, uint64_t fileid)
 {
   int res;
   Hadoop__Hdfs__CompleteRequestProto request = HADOOP__HDFS__COMPLETE_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__CompleteResponseProto *response = NULL;
+  Hadoop__Hdfs__CompleteResponseProto * response = NULL;
 
   assert(fileid != 0);
 
@@ -520,7 +522,7 @@ int hadoop_fuse_mknod(const char * src, mode_t perm, dev_t dev)
   int res;
   Hadoop__Hdfs__CreateRequestProto request = HADOOP__HDFS__CREATE_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__FsPermissionProto permission = HADOOP__HDFS__FS_PERMISSION_PROTO__INIT;
-  Hadoop__Hdfs__CreateResponseProto *response = NULL;
+  Hadoop__Hdfs__CreateResponseProto * response = NULL;
   Hadoop__Hdfs__GetServerDefaultsRequestProto defaults_request = HADOOP__HDFS__GET_SERVER_DEFAULTS_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__GetServerDefaultsResponseProto * defaults_response = NULL;
 
@@ -568,7 +570,7 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
 {
   int res;
   Hadoop__Hdfs__GetFileInfoRequestProto file_request = HADOOP__HDFS__GET_FILE_INFO_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__GetFileInfoResponseProto *file_response = NULL;
+  Hadoop__Hdfs__GetFileInfoResponseProto * file_response = NULL;
   Hadoop__Hdfs__FsPermissionProto permission = HADOOP__HDFS__FS_PERMISSION_PROTO__INIT;
   uint64_t fileid; // of the existing file, or 0
 
@@ -615,7 +617,7 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
     {
       // hadoop sementics means we must "append"
       Hadoop__Hdfs__AppendRequestProto request = HADOOP__HDFS__APPEND_REQUEST_PROTO__INIT;
-      Hadoop__Hdfs__AppendResponseProto *response = NULL;
+      Hadoop__Hdfs__AppendResponseProto * response = NULL;
 
       request.src = (char *) path;
       request.clientname = hadoop_fuse_client_name();
@@ -633,7 +635,7 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
     {
       // "create" a new file
       Hadoop__Hdfs__CreateRequestProto request = HADOOP__HDFS__CREATE_REQUEST_PROTO__INIT;
-      Hadoop__Hdfs__CreateResponseProto *response = NULL;
+      Hadoop__Hdfs__CreateResponseProto * response = NULL;
 
       request.src = (char *) path;
       request.clientname = hadoop_fuse_client_name();
@@ -678,15 +680,13 @@ int hadoop_fuse_truncate(const char * path, off_t offset)
 {
   int res;
   Hadoop__Hdfs__GetFileInfoRequestProto file_request = HADOOP__HDFS__GET_FILE_INFO_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__GetFileInfoResponseProto *file_response = NULL;
-  Hadoop__Hdfs__GetBlockLocationsResponseProto *location_response = NULL;
+  Hadoop__Hdfs__GetFileInfoResponseProto * file_response = NULL;
+  Hadoop__Hdfs__GetBlockLocationsResponseProto * location_response = NULL;
   Hadoop__Hdfs__LocatedBlocksProto * locations;
+  uint64_t oldlength;
+  uint64_t newlength;
 
-  if(offset != 0)
-  {
-    // not sure how to truncate half blocks
-    return -ENOSYS;
-  }
+  assert(offset >= 0);
 
   file_request.src = (char *) path;
   res = CALL_NN("getFileInfo", file_request, file_response);
@@ -699,46 +699,60 @@ int hadoop_fuse_truncate(const char * path, off_t offset)
     res = -ENOENT;
     goto end;
   }
-  if(file_response->fs->locations)
+  newlength = offset;
+  oldlength = file_response->fs->length;
+
+  if(newlength > oldlength)
   {
-    locations = file_response->fs->locations;
+    // extend the current file by appending NULLs
+    res = hadoop_fuse_write(path, NULL, newlength - oldlength, oldlength, NULL);
   }
   else
   {
-    // just have to ask for them
-    Hadoop__Hdfs__GetBlockLocationsRequestProto location_request = HADOOP__HDFS__GET_BLOCK_LOCATIONS_REQUEST_PROTO__INIT;
-    Hadoop__Hdfs__GetBlockLocationsResponseProto *location_response = NULL;
+    // we need to drop or modify blocks
 
-    location_request.src = (char *) path;
-    location_request.offset = 0;
-    location_request.length = file_response->fs->length;
-    res = CALL_NN("getBlockLocations", location_request, location_response);
-    if(res < 0)
+    if(file_response->fs->locations)
     {
-      goto end;
+      locations = file_response->fs->locations;
     }
-    locations = location_response->locations;
-  }
-
-  for(uint32_t b = 0; b < locations->n_blocks; ++b)
-  {
-    Hadoop__Hdfs__AbandonBlockRequestProto abandon_request = HADOOP__HDFS__ABANDON_BLOCK_REQUEST_PROTO__INIT;
-    Hadoop__Hdfs__AbandonBlockResponseProto * abandon_response = NULL;
-
-    abandon_request.src = (char *) path;
-    abandon_request.holder = hadoop_fuse_client_name();
-    abandon_request.b = locations->blocks[b]->b;
-
-    res = CALL_NN("abandonBlock", abandon_request, abandon_response);
-    if(res < 0)
+    else
     {
-      goto end;
+      // just have to ask for them
+      Hadoop__Hdfs__GetBlockLocationsRequestProto location_request = HADOOP__HDFS__GET_BLOCK_LOCATIONS_REQUEST_PROTO__INIT;
+      Hadoop__Hdfs__GetBlockLocationsResponseProto * location_response = NULL;
+
+      location_request.src = (char *) path;
+      location_request.offset = 0;
+      location_request.length = file_response->fs->length;
+      res = CALL_NN("getBlockLocations", location_request, location_response);
+      if(res < 0)
+      {
+        goto end;
+      }
+      locations = location_response->locations;
     }
 
-    hadoop__hdfs__abandon_block_response_proto__free_unpacked(abandon_response, NULL);
+    for(uint32_t b = 0; b < locations->n_blocks; ++b)
+    {
+      Hadoop__Hdfs__AbandonBlockRequestProto abandon_request = HADOOP__HDFS__ABANDON_BLOCK_REQUEST_PROTO__INIT;
+      Hadoop__Hdfs__AbandonBlockResponseProto * abandon_response = NULL;
+
+      abandon_request.src = (char *) path;
+      abandon_request.holder = hadoop_fuse_client_name();
+      abandon_request.b = locations->blocks[b]->b;
+
+      res = CALL_NN("abandonBlock", abandon_request, abandon_response);
+      if(res < 0)
+      {
+        goto end;
+      }
+
+      hadoop__hdfs__abandon_block_response_proto__free_unpacked(abandon_response, NULL);
+    }
+
+    res = 0;
   }
 
-  res = 0;
 end:
   if(file_response)
   {
@@ -754,7 +768,7 @@ end:
 static
 int hadoop_fuse_write_block(
   const char * src,
-  const char * data,
+  const char * data, // if NULL, "len" \0s are written
   size_t len, // len of data
   off_t offset, // offset in block
   const Hadoop__Hdfs__ChecksumProto * checksum,
@@ -909,7 +923,7 @@ int hadoop_fuse_read(const char * src, char * buf, size_t size, off_t offset, st
   (void) fi;
   int res;
   Hadoop__Hdfs__GetBlockLocationsRequestProto request = HADOOP__HDFS__GET_BLOCK_LOCATIONS_REQUEST_PROTO__INIT;
-  Hadoop__Hdfs__GetBlockLocationsResponseProto *response = NULL;
+  Hadoop__Hdfs__GetBlockLocationsResponseProto * response = NULL;
 
   request.src = (char *) src;
   request.offset = offset;
@@ -949,7 +963,7 @@ int hadoop_fuse_read(const char * src, char * buf, size_t size, off_t offset, st
         }
         else
         {
-          Hadoop__Hdfs__BlockOpResponseProto *opresponse = NULL;
+          Hadoop__Hdfs__BlockOpResponseProto * opresponse = NULL;
           bool written = false;
 
           baseheader.block = block->b;
@@ -1022,7 +1036,7 @@ int hadoop_fuse_read(const char * src, char * buf, size_t size, off_t offset, st
 }
 
 static
-void * hadoop_fuse_init(struct fuse_conn_info *conn)
+void * hadoop_fuse_init(struct fuse_conn_info * conn)
 {
   conn->want |= FUSE_CAP_ATOMIC_O_TRUNC;
   conn->capable |= FUSE_CAP_ATOMIC_O_TRUNC;
@@ -1053,7 +1067,7 @@ struct fuse_operations hello_oper = {
   .init = hadoop_fuse_init
 };
 
-int main(int argc, char *argv[])
+int main(int argc, char * argv[])
 {
   struct namenode_state state;
   uint16_t port;

@@ -1,6 +1,7 @@
 
 #include "hadooprpc.h"
 #include "varint.h"
+#include "minmax.h"
 
 #include "proto/IpcConnectionContext.pb-c.h"
 #include "proto/ProtobufRpcEngine.pb-c.h"
@@ -15,11 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef min
-#define min(a, b) (((a) < (b)) ? (a) : (b))
-#define max(a, b) (((a) > (b)) ? (a) : (b))
-#endif
-
 // DECLARATIONS ----------------------------------------------
 
 int hadoop_rpc_disconnect(struct connection_state * state);
@@ -27,7 +23,7 @@ int hadoop_rpc_disconnect(struct connection_state * state);
 static
 int hadoop_rpc_disconnect_namenode(struct namenode_state * state);
 
-// ----------------------------------------------
+// -----------------------------------------------------------
 
 static
 void * hadoop_namenode_worker(void * p)
@@ -46,7 +42,6 @@ void * hadoop_namenode_worker(void * p)
 
     res = hadoop_rpc_call_namenode(
       state,
-      &hadoop__hdfs__client_namenode_protocol__descriptor,
       "renewLease",
       (const ProtobufCMessage *) &request,
       (ProtobufCMessage **) &response);
@@ -97,7 +92,6 @@ ssize_t hadoop_rpc_send_int16(const struct connection_state * state, const uint1
 static inline
 int hadoop_rpc_call_namenode_withlock(
   struct namenode_state * state,
-  const ProtobufCServiceDescriptor * service,
   const char * methodname,
   const ProtobufCMessage * in,
   ProtobufCMessage ** out)
@@ -116,7 +110,9 @@ int hadoop_rpc_call_namenode_withlock(
   Hadoop__Common__RpcResponseHeaderProto * response;
   void * msgbuf;
   uint32_t msglen;
-  const ProtobufCMethodDescriptor * method = protobuf_c_service_descriptor_get_method_by_name(service, methodname);
+  const ProtobufCMethodDescriptor * method = protobuf_c_service_descriptor_get_method_by_name(
+    &hadoop__hdfs__client_namenode_protocol__descriptor,
+    methodname);
   struct connection_state * connection = (struct connection_state *) state;  // struct first element
 
   PACK(msglen, msgbuf, in);
@@ -209,7 +205,6 @@ cleanup:
 int
 hadoop_rpc_call_namenode(
   struct namenode_state * state,
-  const ProtobufCServiceDescriptor * service,
   const char * methodname,
   const ProtobufCMessage * in,
   ProtobufCMessage ** out)
@@ -218,7 +213,7 @@ hadoop_rpc_call_namenode(
   struct connection_state * connection = (struct connection_state *) state;  // struct first element
 
   pthread_mutex_lock(&connection->mutex);
-  res = hadoop_rpc_call_namenode(state, service, methodname, in, out);
+  res = hadoop_rpc_call_namenode_withlock(state, methodname, in, out);
   pthread_mutex_unlock(&connection->mutex);
   return res;
 }
@@ -309,7 +304,6 @@ hadoop_rpc_connect_namenode(struct namenode_state * state, const char * host, co
 
   error = hadoop_rpc_call_namenode_withlock(
     state,
-    &hadoop__hdfs__client_namenode_protocol__descriptor,
     "getServerDefaults",
     (const ProtobufCMessage *) &defaults_request,
     (ProtobufCMessage **) &defaults_response);
@@ -358,7 +352,7 @@ static
 int hadoop_rpc_receive_proto(
   struct connection_state * state,
   ProtobufCMessage ** out,
-  ProtobufCMessage * (*unpack)(ProtobufCAllocator  *, size_t, const uint8_t *))
+  ProtobufCMessage * (* unpack)(ProtobufCAllocator  *, size_t, const uint8_t *))
 {
   int res;
   uint8_t len_varint[5];
@@ -543,7 +537,7 @@ static
 int hadoop_rpc_send_packet(
   struct connection_state * state,
   int64_t seqno,
-  uint8_t * from,
+  uint8_t * from, // can only be NULL if len is 0
   size_t len, // bytes from "from" to read
   off_t offset, // offset in packet
   const Hadoop__Hdfs__ChecksumProto * checksum)
@@ -572,6 +566,8 @@ int hadoop_rpc_send_packet(
   void * headerbuf;
   Hadoop__Hdfs__PacketHeaderProto header = HADOOP__HDFS__PACKET_HEADER_PROTO__INIT;
   Hadoop__Hdfs__PipelineAckProto * ack = NULL;
+
+  assert(from || len);
 
   header.seqno = seqno;
   header.offsetinblock = offset;
@@ -658,14 +654,26 @@ int hadoop_rpc_send_packets(
   while(sent < len)
   {
     size_t packetlen = len - sent;
+    uint8_t * tosend;
+
     if(packetlen > packetsize)
     {
       packetlen = packetsize;
     }
+    if(from)
+    {
+      tosend = from + sent;
+    }
+    else
+    {
+      tosend = alloca(packetlen);
+      memset(&tosend, 0, packetlen);
+    }
+
     res = hadoop_rpc_send_packet(
       state,
       seqno++,
-      from + sent,
+      tosend,
       packetlen,
       offset + sent,
       checksum);
@@ -681,7 +689,7 @@ int hadoop_rpc_send_packets(
   res = hadoop_rpc_send_packet(
     state,
     seqno++,
-    from + sent,
+    NULL,
     0,
     offset + sent,
     checksum);
