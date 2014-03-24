@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef NDEBUG
+#include <syslog.h>
+#endif
+
 // DECLARATIONS ----------------------------------------------
 
 int hadoop_rpc_disconnect(struct connection_state * state);
@@ -567,8 +571,6 @@ int hadoop_rpc_send_packet(
   Hadoop__Hdfs__PacketHeaderProto header = HADOOP__HDFS__PACKET_HEADER_PROTO__INIT;
   Hadoop__Hdfs__PipelineAckProto * ack = NULL;
 
-  assert(from || len);
-
   header.seqno = seqno;
   header.offsetinblock = offset;
   header.lastpacketinblock = len == 0;
@@ -634,6 +636,16 @@ int hadoop_rpc_send_packet(
     }
   }
 
+#ifndef NDEBUG
+  syslog(
+    LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+    "hadoop_rpc_send_packet, sent %llu with bytes: %zd=data %u=packet %u=header",
+    seqno,
+    len,
+    packetlen,
+    headerlen);
+#endif
+
 endpacket:
   hadoop__hdfs__pipeline_ack_proto__free_unpacked(ack, NULL);
   return res;
@@ -650,24 +662,27 @@ int hadoop_rpc_send_packets(
   int res;
   size_t sent = 0;
   int64_t seqno = 0;
+  uint8_t * tosend;
+
+  if(from)
+  {
+    tosend = from;
+  }
+  else
+  {
+    // since we'll use this, we'll make the buffer as big as
+    // we could possibly need.
+    tosend = alloca(packetsize);
+    memset(&packetsize, 0, packetsize);
+  }
 
   while(sent < len)
   {
     size_t packetlen = len - sent;
-    uint8_t * tosend;
 
     if(packetlen > packetsize)
     {
       packetlen = packetsize;
-    }
-    if(from)
-    {
-      tosend = from + sent;
-    }
-    else
-    {
-      tosend = alloca(packetlen);
-      memset(&tosend, 0, packetlen);
     }
 
     res = hadoop_rpc_send_packet(
@@ -683,6 +698,12 @@ int hadoop_rpc_send_packets(
     }
 
     sent += packetlen;
+    if(from)
+    {
+      // we only need to walk through a data buffer, not the fixed
+      // nu
+      tosend += packetlen;
+    }
   }
 
   // sent empty packet to finish
