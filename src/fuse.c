@@ -129,6 +129,14 @@ void unpack_filestatus(Hadoop__Hdfs__HdfsFileStatusProto * fs, struct stat * stb
       stbuf->st_gid = g->gr_gid;
     }
   }
+
+#ifndef NDEBUG
+  syslog(
+    LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+    "unpack_filestatus, length=%llu blocksize=%zd",
+    stbuf->st_size,
+    stbuf->st_blksize);
+#endif
 }
 
 struct Hadoop_Fuse_FileHandle
@@ -615,8 +623,9 @@ int hadoop_fuse_mknod(const char * src, mode_t perm, dev_t dev)
   {
     fh->blocksize = response->fs->blocksize;
   }
-  else
+  if(!fh->blocksize)
   {
+    // missing?
     fh->blocksize = hadoop_fuse_namenode_state()->blocksize;
   }
 
@@ -655,7 +664,7 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
   {
     fileid = file_response->fs->fileid;
     permission.perm = file_response->fs->permission->perm;
-    if(file_response->fs->has_blocksize)
+    if(file_response->fs->has_blocksize && file_response->fs->blocksize)
     {
       blocksize = file_response->fs->blocksize;
     }
@@ -793,7 +802,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
   Hadoop__Hdfs__GetBlockLocationsResponseProto * location_response = NULL;
   Hadoop__Hdfs__LocatedBlocksProto * locations;
   uint64_t oldlength;
-  uint64_t newlength;
+  uint64_t newlength = offset;
 
   assert(offset >= 0);
 
@@ -808,7 +817,6 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
     res = -ENOENT;
     goto end;
   }
-  newlength = offset;
   oldlength = file_response->fs->length;
 
   if(newlength > oldlength)
@@ -816,7 +824,22 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
     // extend the current file by appending NULLs
 
     assert(fi); // we need this for the file handle, &c.
+
+#ifndef NDEBUG
+    syslog(
+      LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+      "hadoop_fuse_ftruncate, writing %llu bytes to %s to ftruncate size up to %zd",
+      newlength - oldlength,
+      path,
+      offset);
+#endif
+
     res = hadoop_fuse_write(path, NULL, newlength - oldlength, oldlength, fi);
+    if(res >= 0)
+    {
+      // write returns the number of bytes written.
+      res = 0;
+    }
   }
   else
   {
@@ -1077,7 +1100,7 @@ int hadoop_fuse_write(const char * src, const char * const data, const size_t le
     if(writetothisblock > 0)
     {
       res = hadoop_fuse_write_block(
-        data + byteswritten,
+        data ? (data + byteswritten) : NULL,
         writetothisblock,
         &checksum,
         block,
@@ -1114,7 +1137,7 @@ int hadoop_fuse_write(const char * src, const char * const data, const size_t le
     }
 
     res = hadoop_fuse_write_block(
-      data + byteswritten,
+      data ? (data + byteswritten) : NULL,
       writetothisblock,
       &checksum,
       block_response->block,

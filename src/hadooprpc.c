@@ -673,7 +673,7 @@ int hadoop_rpc_send_packets(
     // since we'll use this, we'll make the buffer as big as
     // we could possibly need.
     tosend = alloca(packetsize);
-    memset(&packetsize, 0, packetsize);
+    memset(tosend, 0, packetsize);
   }
 
   while(sent < len)
