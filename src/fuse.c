@@ -305,7 +305,8 @@ int hadoop_fuse_write_block(
   const off_t offset, // offset into block
   const size_t len, // len of data
   const Hadoop__Hdfs__ChecksumProto * checksum,
-  const Hadoop__Hdfs__LocatedBlockProto * block)
+  const Hadoop__Hdfs__LocatedBlockProto * block,
+  Hadoop__Hdfs__LocatedBlockProto * newblock)
 {
   int res;
   Hadoop__Hdfs__ClientOperationHeaderProto clientheader = HADOOP__HDFS__CLIENT_OPERATION_HEADER_PROTO__INIT;
@@ -313,21 +314,29 @@ int hadoop_fuse_write_block(
   Hadoop__Hdfs__OpWriteBlockProto oprequest = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__INIT;
   Hadoop__Hdfs__BlockOpResponseProto * opresponse = NULL;
   bool written = false;
+  uint64_t newblocklen = max(newblock->b->has_numbytes ? newblock->b->numbytes : 0, offset + len);
 
   assert(len > 0);
   assert(offset >= 0);
-  assert(block);
+  assert(block->n_locs > 0);
 
   clientheader.clientname = hadoop_fuse_client_name();
   baseheader.block = block->b;
-  baseheader.token = block->blocktoken;
+  baseheader.token = newblock->blocktoken;
   clientheader.baseheader = &baseheader;
   oprequest.header = &clientheader;
   oprequest.pipelinesize = block->n_locs; // not actually used?
-  oprequest.stage = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__BLOCK_CONSTRUCTION_STAGE__PIPELINE_SETUP_CREATE;
-  oprequest.latestgenerationstamp = block->b->generationstamp;
-  oprequest.minbytesrcvd = len;
-  oprequest.maxbytesrcvd = len;
+  if(newblock->b->generationstamp == block->b->generationstamp)
+  {
+    oprequest.stage = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__BLOCK_CONSTRUCTION_STAGE__PIPELINE_SETUP_CREATE;
+  }
+  else
+  {
+    oprequest.stage = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__BLOCK_CONSTRUCTION_STAGE__PIPELINE_SETUP_APPEND;
+  }
+  oprequest.latestgenerationstamp = newblock->b->generationstamp;
+  oprequest.minbytesrcvd = newblock->b->numbytes;
+  oprequest.maxbytesrcvd = newblocklen;
   oprequest.requestedchecksum = (Hadoop__Hdfs__ChecksumProto *) checksum;
 
   // targets are the other DNs in the pipeline that the DN we send our block
@@ -340,7 +349,7 @@ int hadoop_fuse_write_block(
   // choose the "closest".
   for (size_t l = 0; l < block->n_locs && !written; ++l)
   {
-    Hadoop__Hdfs__DatanodeInfoProto * location = block->locs[l];
+    const Hadoop__Hdfs__DatanodeInfoProto * location = block->locs[l];
     struct connection_state dn_state;
 
     // build the target list without this location
@@ -387,7 +396,7 @@ int hadoop_fuse_write_block(
       offset,
       block->b->poolid,
       block->b->blockid,
-      block->b->generationstamp,
+      newblock->b->generationstamp,
       location->id->ipaddr,
       location->id->xferport,
       l + 1,
@@ -397,17 +406,8 @@ int hadoop_fuse_write_block(
 
   if(written)
   {
-    // bookkeeping: update the sizes
-    if(block->b->has_numbytes)
-    {
-      block->b->numbytes = max(block->b->numbytes, offset + len);
-    }
-    else
-    {
-      block->b->has_numbytes = true;
-      block->b->numbytes = offset + len;
-    }
-
+    newblock->b->has_numbytes = true;
+    newblock->b->numbytes = newblocklen;
     return len;
   }
   else
@@ -474,32 +474,91 @@ int hadoop_fuse_do_write(
 
     if(writetothisblock > 0)
     {
+      Hadoop__Hdfs__UpdateBlockForPipelineRequestProto updateblockrequest = HADOOP__HDFS__UPDATE_BLOCK_FOR_PIPELINE_REQUEST_PROTO__INIT;
+      Hadoop__Hdfs__UpdateBlockForPipelineResponseProto * updateblockresponse = NULL;
+      Hadoop__Hdfs__UpdatePipelineRequestProto updaterequest = HADOOP__HDFS__UPDATE_PIPELINE_REQUEST_PROTO__INIT;
+      Hadoop__Hdfs__UpdatePipelineResponseProto * updateresponse = NULL;
+      Hadoop__Hdfs__DatanodeIDProto ** newnodes = NULL;
+
+      updateblockrequest.clientname = hadoop_fuse_client_name();
+      updateblockrequest.block = block->b;
+
+      // since we're updating a block, we need to get a new "generation stamp" (version)
+      // from the NN.
+      res = CALL_NN("updateBlockForPipeline", updateblockrequest, updateblockresponse);
+      if(res < 0)
+      {
+        goto endwrite;
+      }
+
+#ifndef NDEBUG
+      syslog(
+        LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+        "hadoop_fuse_do_write got version %llu for block %s blk_%llu_%llu on %zd node(s) (writing %llu bytes to block offset %llu, file offset %llu)",
+        updateblockresponse->block->b->generationstamp,
+        block->b->poolid,
+        block->b->blockid,
+        block->b->generationstamp,
+        block->n_locs,
+        writetothisblock,
+        offsetintoblock,
+        offsetintofile);
+#endif
+
       res = hadoop_fuse_write_block(
         data ? (data + byteswritten) : NULL,
         offsetintoblock,
         writetothisblock,
         &checksum,
-        block);
+        block,
+        updateblockresponse->block);
       if(res < 0)
       {
-        goto end;
+        goto endwrite;
       }
 
-      byteswritten += res;
-      hadoop_fuse_clone_block(block->b, last);
-    }
+      // tell the NN we've updated the block
 
-#ifndef NDEBUG
-    syslog(
-      LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_do_write wrote %llu bytes (block offset %llu, file offset %llu) of block %s blk_%llu_%llu",
-      writetothisblock,
-      offsetintoblock,
-      offsetintofile,
-      block->b->poolid,
-      block->b->blockid,
-      block->b->generationstamp);
-#endif
+      newnodes = alloca(block->n_locs * sizeof(*newnodes));
+      for(size_t n = 0; n < block->n_locs; ++n)
+      {
+        newnodes[n] = block->locs[n]->id;
+      }
+
+      updaterequest.clientname = hadoop_fuse_client_name();
+      updaterequest.oldblock = block->b;
+      updaterequest.newblock = updateblockresponse->block->b;
+      updaterequest.n_newnodes = block->n_locs;
+      updaterequest.newnodes = newnodes;
+      updaterequest.n_storageids = block->n_storageids;
+      updaterequest.storageids = block->storageids;
+
+      res = CALL_NN("updatePipeline", updaterequest, updateresponse);
+      if(res < 0)
+      {
+        goto endwrite;
+      }
+
+      hadoop_fuse_clone_block(updateblockresponse->block->b, last);
+
+endwrite:
+      if(updateblockresponse)
+      {
+        hadoop__hdfs__update_block_for_pipeline_response_proto__free_unpacked(updateblockresponse, NULL);
+      }
+      if(updateresponse)
+      {
+        hadoop__hdfs__update_pipeline_response_proto__free_unpacked(updateresponse, NULL);
+      }
+      if(res < 0)
+      {
+        return res;
+      }
+      else
+      {
+        byteswritten += writetothisblock;
+      }
+    }
   }
 
   // (4) if we've still got some more to write, keep tacking on blocks
@@ -521,7 +580,7 @@ int hadoop_fuse_do_write(
     res = CALL_NN("addBlock", block_request, block_response);
     if(res < 0)
     {
-      goto end;
+      return res;
     }
 
     res = hadoop_fuse_write_block(
@@ -529,12 +588,24 @@ int hadoop_fuse_do_write(
       0, // block offset
       writetothisblock,
       &checksum,
+      block_response->block,
       block_response->block);
     if(res < 0)
     {
       hadoop__hdfs__add_block_response_proto__free_unpacked(block_response, NULL);
-      goto end;
+      return res;
     }
+
+#ifndef NDEBUG
+    syslog(
+      LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+      "hadoop_fuse_do_write added new block %s blk_%llu_%llu on %zd node(s) (writing %llu bytes to block offset 0)",
+      block_response->block->b->poolid,
+      block_response->block->b->blockid,
+      block_response->block->b->generationstamp,
+      block_response->block->n_locs,
+      writetothisblock);
+#endif
 
     byteswritten += writetothisblock;
     hadoop_fuse_clone_block(block_response->block->b, last);
@@ -542,9 +613,7 @@ int hadoop_fuse_do_write(
     hadoop__hdfs__add_block_response_proto__free_unpacked(block_response, NULL);
   }
 
-  res = 0;
-end:
-  return res;
+  return 0;
 }
 
 // FUSE OPERATIONS -------------------------------------------
@@ -889,16 +958,6 @@ int hadoop_fuse_fsync(const char * src, int datasync, struct fuse_file_info * fi
 }
 
 static
-int hadoop_fuse_release(const char * src, struct fuse_file_info * fi)
-{
-  (void) src;
-  (void) fi;
-
-  // we complete after each write, so don't need to do anything here
-  return 0;
-}
-
-static
 int hadoop_fuse_mknod(const char * src, mode_t perm, dev_t dev)
 {
   (void) dev;
@@ -1142,15 +1201,6 @@ int hadoop_fuse_write(
     goto end;
   }
 
-#ifndef NDEBUG
-  syslog(
-    LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "hadoop_fuse_write, writing %zd bytes (offset %zd) to %s",
-    len,
-    offset,
-    src);
-#endif
-
   res = hadoop_fuse_lock(src, &last);
   if(res < 0)
   {
@@ -1341,7 +1391,6 @@ struct fuse_operations hello_oper = {
   .open = hadoop_fuse_open,
   .read = hadoop_fuse_read,
   .fsync = hadoop_fuse_fsync,
-  .release = hadoop_fuse_release,
   .mknod = hadoop_fuse_mknod,
   .write = hadoop_fuse_write,
   .truncate = hadoop_fuse_truncate,

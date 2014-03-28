@@ -341,15 +341,18 @@ hadoop_rpc_connect_datanode(struct connection_state * state, const char * host, 
   state->servaddr.sin_port = htons(port);
 
   res = connect(state->sockfd, (struct sockaddr *) &state->servaddr, sizeof(state->servaddr));
-  if(res < 0)
-  {
-    return -EHOSTUNREACH;
-  }
-  else
-  {
-    state->isconnected = true;
-    return 0;
-  }
+
+#ifndef NDEBUG
+  syslog(
+    LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+    "hadoop_rpc_connect_datanode, to %s:%u => %zd",
+    host,
+    port,
+    res);
+#endif
+
+  state->isconnected = res == 0;
+  return res;
 }
 
 static
@@ -421,7 +424,7 @@ int hadoop_rpc_call_datanode(
   switch((*out)->status)
   {
   case HADOOP__HDFS__STATUS__ERROR:
-    res = -EINVAL;
+    res = -EPROTO;
     break;
   case HADOOP__HDFS__STATUS__ERROR_CHECKSUM:
     res = -EBADMSG;
