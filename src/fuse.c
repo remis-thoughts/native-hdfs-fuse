@@ -369,34 +369,32 @@ int hadoop_fuse_write_block(
     }
 
     res = hadoop_rpc_call_datanode(&dn_state, 80, (const ProtobufCMessage *) &oprequest, &opresponse);
-    if(res < 0)
+    if(res == 0)
     {
-      hadoop_rpc_disconnect(&dn_state);
-      continue;
+      hadoop__hdfs__block_op_response_proto__free_unpacked(opresponse, NULL);
+      res = hadoop_rpc_send_packets(
+        &dn_state,
+        (uint8_t *) data,
+        len,
+        offset,
+        hadoop_fuse_namenode_state()->packetsize,
+        checksum);
+      written = res == 0;
     }
-    hadoop__hdfs__block_op_response_proto__free_unpacked(opresponse, NULL);
-
-    res = hadoop_rpc_send_packets(
-      &dn_state,
-      (uint8_t *) data,
-      len,
-      0,
-      hadoop_fuse_namenode_state()->packetsize,
-      checksum);
-
-    written = res == 0;
     hadoop_rpc_disconnect(&dn_state);
 
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_write_block, %s %zd bytes (offset %zd) of block %s blk_%llu_%llu to DN %s:%d (%zd of %zd)",
+      "hadoop_fuse_write_block, %s %zd bytes (offset %zd) of block %s blk_%llu_%llu (was: %llu, now: %lli) to DN %s:%d (%zd of %zd)",
       (written ? "written" : "NOT written"),
       len,
       offset,
       block->b->poolid,
       block->b->blockid,
       newblock->b->generationstamp,
+      newblock->b->numbytes,
+      newblocklen,
       location->id->ipaddr,
       location->id->xferport,
       l + 1,
@@ -441,7 +439,7 @@ int hadoop_fuse_do_write(
 
   // (2) set up the checksum algorithm we'll use to transfer the data
   checksum.type = HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_NULL;
-  checksum.bytesperchecksum = hadoop_fuse_namenode_state()->packetsize;
+  checksum.bytesperchecksum = hadoop_fuse_namenode_state()->bytesperchecksum;
 
   // (3) loop through the blocks, seeing if we have to overwrite any.
   for(size_t b = 0; b < numblocks; ++b)
@@ -1115,36 +1113,48 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
     {
       Hadoop__Hdfs__LocatedBlockProto * block = response->locations->blocks[b - 1];
 
-      if(block->offset < newlength)
+      if(block->offset + block->b->numbytes <= newlength)
       {
-        // we need all blocks before this one (and this one too!)
+        // we need the whole of this block, and since we're iterating
+        // through the file backwards we need all subsequent blocks.
         break;
       }
 
-      abandon_request.b = block->b;
+      if(block->offset < newlength)
+      {
+        // we need a bit of this block
+        assert(false);
+      }
+      else
+      {
+        // the block starts on or after the new length, so toss the whole
+        // thing
+
+        abandon_request.b = block->b;
 
 #ifndef NDEBUG
-      syslog(
-        LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-        "hadoop_fuse_ftruncate, dropping block %s blk_%llu_%llu of %s as start %llu >= offset %llu",
-        block->b->poolid,
-        block->b->blockid,
-        block->b->generationstamp,
-        path,
-        block->offset,
-        newlength);
+        syslog(
+          LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+          "hadoop_fuse_ftruncate, dropping block %s blk_%llu_%llu of %s as start %llu >= offset %llu",
+          block->b->poolid,
+          block->b->blockid,
+          block->b->generationstamp,
+          path,
+          block->offset,
+          newlength);
 #endif
 
-      res = CALL_NN("abandonBlock", abandon_request, abandon_response);
-      if(res < 0)
-      {
-        goto end;
-      }
+        res = CALL_NN("abandonBlock", abandon_request, abandon_response);
+        if(res < 0)
+        {
+          goto end;
+        }
 
-      hadoop_fuse_clone_block(block->b, &last);
-      last->has_numbytes = true;
-      last->numbytes = 0;
-      hadoop__hdfs__abandon_block_response_proto__free_unpacked(abandon_response, NULL);
+        hadoop_fuse_clone_block(block->b, &last);
+        last->has_numbytes = true;
+        last->numbytes = 0;
+        hadoop__hdfs__abandon_block_response_proto__free_unpacked(abandon_response, NULL);
+      }
     }
   }
 

@@ -25,6 +25,8 @@ struct namenode_state {
   uint32_t packetsize;
   uint64_t blocksize;
   uint32_t replication;
+  uint32_t bytesperchecksum;
+  Hadoop__Hdfs__ChecksumTypeProto checksumtype;
 };
 
 int hadoop_rpc_connect_namenode(

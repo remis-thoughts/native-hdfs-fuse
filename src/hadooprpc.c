@@ -318,6 +318,15 @@ hadoop_rpc_connect_namenode(struct namenode_state * state, const char * host, co
   state->packetsize = defaults_response->serverdefaults->writepacketsize;
   state->blocksize = defaults_response->serverdefaults->blocksize;
   state->replication = defaults_response->serverdefaults->replication;
+  state->bytesperchecksum = defaults_response->serverdefaults->bytesperchecksum;
+  if(defaults_response->serverdefaults->has_checksumtype)
+  {
+    state->checksumtype = defaults_response->serverdefaults->checksumtype;
+  }
+  else
+  {
+    state->checksumtype = HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_NULL; // is this a sensible default?
+  }
   hadoop__hdfs__get_server_defaults_response_proto__free_unpacked(defaults_response, NULL);
 
   connection->isconnected = true;
@@ -586,22 +595,22 @@ int hadoop_rpc_send_packet(
   res = hadoop_rpc_send_int32(state, packetlen);
   if(res < 0)
   {
-    return res;
+    goto endpacket;
   }
   res = hadoop_rpc_send_int16(state, headerlen);
   if(res < 0)
   {
-    return res;
+    goto endpacket;
   }
   res = hadoop_rpc_send(state, headerbuf, headerlen);
   if(res < 0)
   {
-    return res;
+    goto endpacket;
   }
   res = hadoop_rpc_send(state, from, header.datalen);
   if(res < 0)
   {
-    return res;
+    goto endpacket;
   }
 
   // now get the ack
@@ -611,7 +620,7 @@ int hadoop_rpc_send_packet(
     (ProtobufCMessage * (*)(ProtobufCAllocator  *, size_t, const uint8_t *))hadoop__hdfs__pipeline_ack_proto__unpack);
   if(res < 0)
   {
-    return res;
+    goto endpacket;
   }
 
   if(ack->seqno != seqno)
@@ -639,18 +648,23 @@ int hadoop_rpc_send_packet(
     }
   }
 
+endpacket:
 #ifndef NDEBUG
   syslog(
     LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "hadoop_rpc_send_packet, sent %llu with bytes: %zd=data %u=packet %u=header",
+    "hadoop_rpc_send_packet, %s %llu |data|=%zd |packet|=%u |header|=%u offset=%zd => %d",
+    res < 0 ? "FAILED to send" : "sent",
     seqno,
     len,
     packetlen,
-    headerlen);
+    headerlen,
+    offset,
+    res);
 #endif
-
-endpacket:
-  hadoop__hdfs__pipeline_ack_proto__free_unpacked(ack, NULL);
+  if(ack)
+  {
+    hadoop__hdfs__pipeline_ack_proto__free_unpacked(ack, NULL);
+  }
   return res;
 }
 
@@ -682,8 +696,17 @@ int hadoop_rpc_send_packets(
   while(sent < len)
   {
     size_t packetlen = len - sent;
+    off_t packetoffset = offset + sent;
+    uint32_t bytespastboundary = packetoffset % checksum->bytesperchecksum;
 
-    if(packetlen > packetsize)
+    if(bytespastboundary != 0)
+    {
+      // if we have a "partial" checksum - i.e. we're not starting
+      // on a "bytesperchecksum" boundary, we can only have this one
+      // (partial) chunk in the packet
+      packetlen = checksum->bytesperchecksum - bytespastboundary;
+    }
+    else if(packetlen > packetsize)
     {
       packetlen = packetsize;
     }
@@ -693,7 +716,7 @@ int hadoop_rpc_send_packets(
       seqno++,
       tosend,
       packetlen,
-      offset + sent,
+      packetoffset,
       checksum);
     if(res < 0)
     {
