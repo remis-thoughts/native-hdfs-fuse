@@ -942,11 +942,7 @@ int hadoop_fuse_readdir(const char * path, void * buf, fuse_fill_dir_t filler, o
     }
   }
 
-  if(filename)
-  {
-    free(filename);
-  }
-
+  free(filename);
   hadoop__hdfs__get_listing_response_proto__free_unpacked(response, NULL);
   return 0;
 }
@@ -1121,6 +1117,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
   }
   else
   {
+    // put the abandon block messages here as we may make more than one call
     Hadoop__Hdfs__AbandonBlockRequestProto abandon_request = HADOOP__HDFS__ABANDON_BLOCK_REQUEST_PROTO__INIT;
     Hadoop__Hdfs__AbandonBlockResponseProto * abandon_response = NULL;
 
@@ -1140,8 +1137,51 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
 
       if(block->offset < newlength)
       {
-        // we need a bit of this block
-        assert(false);
+        // we need a bit of this block. This block of code should
+        // only be executed for one of the blocks in the file.
+
+        Hadoop__Hdfs__UpdateBlockForPipelineRequestProto updateblockrequest = HADOOP__HDFS__UPDATE_BLOCK_FOR_PIPELINE_REQUEST_PROTO__INIT;
+        Hadoop__Hdfs__UpdateBlockForPipelineResponseProto * updateblockresponse = NULL;
+        Hadoop__Hdfs__UpdatePipelineRequestProto updaterequest = HADOOP__HDFS__UPDATE_PIPELINE_REQUEST_PROTO__INIT;
+        Hadoop__Hdfs__UpdatePipelineResponseProto * updateresponse = NULL;
+        Hadoop__Hdfs__DatanodeIDProto ** newnodes = NULL;
+
+        updateblockrequest.clientname = hadoop_fuse_client_name();
+        updateblockrequest.block = block->b;
+
+        res = CALL_NN("updateBlockForPipeline", updateblockrequest, updateblockresponse);
+        if(res < 0)
+        {
+          goto end;
+        }
+
+        // do the truncation
+        updateblockresponse->block->b->has_numbytes = true;
+        updateblockresponse->block->b->numbytes = newlength - block->offset;
+
+        newnodes = alloca(block->n_locs * sizeof(*newnodes));
+        for(size_t n = 0; n < block->n_locs; ++n)
+        {
+          newnodes[n] = block->locs[n]->id;
+        }
+
+        updaterequest.clientname = hadoop_fuse_client_name();
+        updaterequest.oldblock = block->b;
+        updaterequest.newblock = updateblockresponse->block->b;
+        updaterequest.n_newnodes = block->n_locs;
+        updaterequest.newnodes = newnodes;
+        updaterequest.n_storageids = block->n_storageids;
+        updaterequest.storageids = block->storageids;
+
+        res = CALL_NN("updatePipeline", updaterequest, updateresponse);
+        if(res < 0)
+        {
+          goto end;
+        }
+
+        hadoop_fuse_clone_block(updateblockresponse->block->b, &last);
+        hadoop__hdfs__update_block_for_pipeline_response_proto__free_unpacked(updateblockresponse, NULL);
+        hadoop__hdfs__update_pipeline_response_proto__free_unpacked(updateresponse, NULL);
       }
       else
       {
