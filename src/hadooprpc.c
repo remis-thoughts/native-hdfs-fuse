@@ -224,7 +224,9 @@ hadoop_rpc_call_namenode(
 
 int hadoop_rpc_disconnect(struct connection_state * state)
 {
-  close(state->sockfd); // don't care if we fail
+  // don't care if we fail, but shutdown instead of close to make
+  // sure we've flushed anything we've sent.
+  shutdown(state->sockfd, SHUT_WR);
   state->isconnected = false;
   return 0;
 }
@@ -487,6 +489,7 @@ int hadoop_rpc_receive_packets(
     void * headerbuf;
     Hadoop__Hdfs__PacketHeaderProto * header;
     size_t available;
+    ssize_t read = 0;
 
     res = recvfrom(state->sockfd, &packetlen, sizeof(packetlen), MSG_WAITALL, NULL, NULL);
     if(res < 0)
@@ -514,26 +517,33 @@ int hadoop_rpc_receive_packets(
     more = !header->lastpacketinblock;
     hadoop__hdfs__packet_header_proto__free_unpacked(header, NULL);
 
-    if(skipbytes > 0)
+    while(skipbytes > 0 && available > 0)
     {
-      ssize_t skipped = min(available, skipbytes);
+      // we need buffer space to put the data in ("len") and data in
+      // the packet ("available")
+      ssize_t skipped = min(min(available, skipbytes), len);
+
       res = recvfrom(state->sockfd, to, skipped, MSG_WAITALL, NULL, NULL);
       if(res < 0)
       {
         return res;
       }
       available -= skipped;
+      skipbytes -= skipped;
+      // we won't increment the "to" pointer as we want to overwrite this "skipped"
+      // data with the real data in the next block.
     }
 
     if(available > 0)
     {
-      ssize_t read = min(available, len);
+      read = min(available, len);
       res = recvfrom(state->sockfd, to, read, MSG_WAITALL, NULL, NULL);
       if(res < 0)
       {
         return res;
       }
       len -= read;
+      to += read;
     }
   }
 
