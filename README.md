@@ -1,4 +1,5 @@
-native-hdfs-fuse
-================
+# Native HDFS Fuse Implementation
 
-C HDFS FUSE implementation, no libhdfs
+## Testing
+
+Tested using [fsx](http://svnweb.freebsd.org/base/head/tools/regression/fsx)

@@ -404,7 +404,7 @@ int hadoop_fuse_write_block(
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_write_block, %s %zd bytes (offset %zd) of block %s blk_%llu_%llu (was: %llu, now: %lli) to DN %s:%d (%zd of %zd)",
+      "hadoop_fuse_write_block, %s %zd bytes (offset %zd) of block %s blk_%llu_%llu (was: %llu, now: %lli) to DN %s:%d (%zd of %zd) => %d",
       (written ? "written" : "NOT written"),
       len,
       offset,
@@ -416,7 +416,8 @@ int hadoop_fuse_write_block(
       location->id->ipaddr,
       location->id->xferport,
       l + 1,
-      block->n_locs);
+      block->n_locs,
+      res);
 #endif
   }
 
@@ -608,6 +609,19 @@ endwrite:
       block_response->block);
     if(res < 0)
     {
+      // we failed to write data into our new block. We'll try and keep HDFS
+      // consisitent, so we'll tell the NN to throw away this failed block.
+      // This may well work, as "hadoop_fuse_write_block" only talks to a DN, so
+      // even if that fails there's every chance the NN will still be responsive.
+      Hadoop__Hdfs__AbandonBlockRequestProto abandon_request = HADOOP__HDFS__ABANDON_BLOCK_REQUEST_PROTO__INIT;
+      Hadoop__Hdfs__AbandonBlockResponseProto * abandon_response = NULL;
+
+      abandon_request.src = (char *) src;
+      abandon_request.holder = hadoop_fuse_client_name();
+      abandon_request.b = block_response->block->b;
+
+      CALL_NN("abandonBlock", abandon_request, abandon_response); // ignore return value.
+
       hadoop__hdfs__add_block_response_proto__free_unpacked(block_response, NULL);
       return res;
     }
@@ -1131,10 +1145,11 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_ftruncate, writing %llu bytes to %s to ftruncate size up to %zd",
+      "hadoop_fuse_ftruncate, writing %llu bytes to %s to ftruncate size up to %llu (from %llu)",
       newlength - oldlength,
       path,
-      offset);
+      newlength,
+      oldlength);
 #endif
 
     LOCK();
@@ -1181,7 +1196,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
         // HDFS blocks are append-only so we have to get the data we want
         // to preserve, abandon the old (longer) block, add a new (shorter)
         // block and put the data back.
-        byteskept = alloca(bytestokeep);
+        byteskept = malloc(bytestokeep);
 
         // we can't read while the file's locked
         if(locked)
@@ -1235,6 +1250,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
           (struct Hadoop_Fuse_FileHandle *) fi->fh,
           NULL, // we don't care about the old locations as we're appending a new block.
           &last);
+        free(byteskept);
         if(res < 0)
         {
           goto end;
@@ -1244,13 +1260,13 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
   }
 
   // persist the data we've just written, & release the lease we have on "src"
+  res = 0;
+
+end:
   if(locked)
   {
     UNLOCK();
   }
-  res = 0;
-
-end:
   hadoop__hdfs__get_block_locations_response_proto__free_unpacked(response, NULL);
   if(last)
   {
@@ -1346,6 +1362,9 @@ int hadoop_fuse_read(const char * src, char * buf, size_t size, off_t offset, st
   int res;
   Hadoop__Hdfs__GetBlockLocationsRequestProto request = HADOOP__HDFS__GET_BLOCK_LOCATIONS_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__GetBlockLocationsResponseProto * response = NULL;
+  Hadoop__Hdfs__ClientOperationHeaderProto clientheader = HADOOP__HDFS__CLIENT_OPERATION_HEADER_PROTO__INIT;
+  Hadoop__Hdfs__BaseHeaderProto baseheader = HADOOP__HDFS__BASE_HEADER_PROTO__INIT;
+  Hadoop__Hdfs__OpReadBlockProto op = HADOOP__HDFS__OP_READ_BLOCK_PROTO__INIT;
 
   request.src = (char *) src;
   request.offset = offset;
@@ -1355,118 +1374,122 @@ int hadoop_fuse_read(const char * src, char * buf, size_t size, off_t offset, st
   {
     return res;
   }
-  else
+  if(!response->locations)
   {
-    Hadoop__Hdfs__LocatedBlocksProto * locations = response->locations;
+    res = -ENOENT;
+    goto end;
+  }
+  if(response->locations->underconstruction)
+  {
+    // This means that some (other?) client has the lease on this
+    // file. Try again later - maybe they'll have release it?
+    res = -EAGAIN;
+    goto end;
+  }
 
-    if(!locations)
+  clientheader.clientname = hadoop_fuse_client_name();
+
+  for (size_t b = 0; b < response->locations->n_blocks; ++b)
+  {
+    Hadoop__Hdfs__LocatedBlockProto * block = response->locations->blocks[b];
+    Hadoop__Hdfs__BlockOpResponseProto * opresponse = NULL;
+    bool read = false;
+
+    if(block->corrupt)
     {
-      res = -ENOENT;
+      res = -EBADMSG;
+      continue;
     }
-    else if(locations->underconstruction)
-    {
-      // This means that some (other?) client has the lease on this
-      // file. Try again later - maybe they'll have release it?
-      res = -EAGAIN;
-    }
-    else
-    {
-      Hadoop__Hdfs__ClientOperationHeaderProto clientheader = HADOOP__HDFS__CLIENT_OPERATION_HEADER_PROTO__INIT;
-      Hadoop__Hdfs__BaseHeaderProto baseheader = HADOOP__HDFS__BASE_HEADER_PROTO__INIT;
-      Hadoop__Hdfs__OpReadBlockProto op = HADOOP__HDFS__OP_READ_BLOCK_PROTO__INIT;
 
-      clientheader.clientname = hadoop_fuse_client_name();
+    baseheader.block = block->b;
+    clientheader.baseheader = &baseheader;
+    op.header = &clientheader;
+    op.has_sendchecksums = true;
+    op.sendchecksums = false;
+    op.offset = min(offset - block->offset, 0);     // offset into file -> offset into block
+    op.len = min(block->b->numbytes - op.offset, size);
 
-      for (size_t b = 0; b < locations->n_blocks; ++b)
+    // for now, don't care about which location we get it from
+    for (size_t l = 0; l < block->n_locs && !read; ++l)
+    {
+      Hadoop__Hdfs__DatanodeInfoProto * location = block->locs[l];
+      struct connection_state dn_state;
+      uint64_t skipbytes;
+
+      memset(&dn_state, 0, sizeof(dn_state));
+      res = hadoop_rpc_connect_datanode(&dn_state, location->id->ipaddr, location->id->xferport);
+      if(res < 0)
       {
-        Hadoop__Hdfs__LocatedBlockProto * block = locations->blocks[b];
-
-        if(block->corrupt)
-        {
-          res = -EBADMSG;
-        }
-        else
-        {
-          Hadoop__Hdfs__BlockOpResponseProto * opresponse = NULL;
-          bool written = false;
-
-          baseheader.block = block->b;
-          clientheader.baseheader = &baseheader;
-          op.header = &clientheader;
-          op.has_sendchecksums = true;
-          op.sendchecksums = false;
-          op.offset = min(offset - block->offset, 0); // offset into file -> offset into block
-          op.len = min(block->b->numbytes - op.offset, size);
-
-          // for now, don't care about which location we get it from
-          for (size_t l = 0; l < block->n_locs; ++l)
-          {
-            Hadoop__Hdfs__DatanodeInfoProto * location = block->locs[l];
-            struct connection_state dn_state;
-            uint64_t skipbytes;
-
-            memset(&dn_state, 0, sizeof(dn_state));
-            res = hadoop_rpc_connect_datanode(&dn_state, location->id->ipaddr, location->id->xferport);
-            if(res < 0)
-            {
-              continue;
-            }
-
-            res = hadoop_rpc_call_datanode(&dn_state, 81, (const ProtobufCMessage *) &op, &opresponse);
-            if(res < 0)
-            {
-              hadoop_rpc_disconnect(&dn_state);
-              continue;
-            }
-            if(opresponse->readopchecksuminfo)
-            {
-              skipbytes =  op.offset - opresponse->readopchecksuminfo->chunkoffset;
-            }
-            else
-            {
-              skipbytes = 0;
-            }
-            hadoop__hdfs__block_op_response_proto__free_unpacked(opresponse, NULL);
-
-            res = hadoop_rpc_receive_packets(
-              &dn_state,
-              skipbytes,
-              op.len,
-              (uint8_t *) buf);
-            if(res < 0)
-            {
-              hadoop_rpc_disconnect(&dn_state);
-              continue;
-            }
-
-            written = true;
-            hadoop_rpc_disconnect(&dn_state);
-            break;
-          }
-
-          if(!written)
-          {
-            return -EIO;
-          }
-        }
+        continue;
       }
 
-      res = size;
+      res = hadoop_rpc_call_datanode(&dn_state, 81, (const ProtobufCMessage *) &op, &opresponse);
+      if(res < 0)
+      {
+        hadoop_rpc_disconnect(&dn_state);
+        continue;
+      }
+      if(opresponse->readopchecksuminfo)
+      {
+        skipbytes =  op.offset - opresponse->readopchecksuminfo->chunkoffset;
+      }
+      else
+      {
+        skipbytes = 0;
+      }
+      hadoop__hdfs__block_op_response_proto__free_unpacked(opresponse, NULL);
+
+      res = hadoop_rpc_receive_packets(
+        &dn_state,
+        skipbytes,
+        op.len,
+        (uint8_t *) buf);
+      if(res < 0)
+      {
+        hadoop_rpc_disconnect(&dn_state);
+        continue;
+      }
+
+      read = true;
+      hadoop_rpc_disconnect(&dn_state);
     }
 
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_read, read %zd bytes from %s (offset %zd) => %zd",
-      size,
-      src,
-      offset,
+      "hadoop_fuse_read, %s %llu (of %llu) bytes at offset %llu of block %s blk_%llu_%llu => %d",
+      (read ? "read" : "NOT read"),
+      op.len,
+      block->b->numbytes,
+      op.offset,
+      block->b->poolid,
+      block->b->blockid,
+      block->b->generationstamp,
       res);
 #endif
 
-    hadoop__hdfs__get_block_locations_response_proto__free_unpacked(response, NULL);
-    return res;
+    if(!read)
+    {
+      res = res < 0 ? res : -EIO; // use existing error as more specific
+      goto end;
+    }
   }
+
+  // FUSE semantics, return bytes written on success
+  res = size;
+
+end:
+#ifndef NDEBUG
+  syslog(
+    LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+    "hadoop_fuse_read, read %zd bytes from %s (offset %zd) => %d",
+    size,
+    src,
+    offset,
+    res);
+#endif
+  hadoop__hdfs__get_block_locations_response_proto__free_unpacked(response, NULL);
+  return res;
 }
 
 static
@@ -1518,18 +1541,27 @@ int main(int argc, char * argv[])
   state.clientname = "hadoop_fuse";
   pthread_mutex_init(&state.connection.mutex, NULL);
 
-#ifndef NDEBUG
-  openlog (state.clientname, LOG_CONS | LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_USER);
-  signal(SIGSEGV, dump_trace);
-  syslog(LOG_MAKEPRI(LOG_USER, LOG_DEBUG), "starting, connecting to hdfs://%s:%d", argv[1], port);
-#endif
-
   res = hadoop_rpc_connect_namenode(&state, argv[1], port);
   if(res < 0)
   {
     fprintf(stderr, "connection to hdfs://%s:%d failed: %s\n", argv[1], port, strerror(-res));
     return 1;
   }
+
+#ifndef NDEBUG
+  openlog (state.clientname, LOG_CONS | LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_USER);
+  signal(SIGSEGV, dump_trace);
+  syslog(
+    LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+    "connected to hdfs://%s:%d, defaults: packetsize=%u, blocksize=%llu, replication=%u, bytesperchecksum=%u, checksumtype=%u",
+    argv[1],
+    port,
+    state.packetsize,
+    state.blocksize,
+    state.replication,
+    state.bytesperchecksum,
+    state.checksumtype);
+#endif
 
   for(int i = 3; i < argc; ++i)
   {

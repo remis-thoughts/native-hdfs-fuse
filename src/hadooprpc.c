@@ -224,9 +224,9 @@ hadoop_rpc_call_namenode(
 
 int hadoop_rpc_disconnect(struct connection_state * state)
 {
-  // don't care if we fail, but shutdown instead of close to make
-  // sure we've flushed anything we've sent.
-  shutdown(state->sockfd, SHUT_WR);
+  // don't care if we fail, and we use SO_LINGER to ensure we flush
+  // any outgoing data.
+  close(state->sockfd);
   state->isconnected = false;
   return 0;
 }
@@ -236,6 +236,40 @@ int hadoop_rpc_disconnect_namenode(struct namenode_state * state)
 {
   hadoop_rpc_disconnect((struct connection_state *) state);
   pthread_cancel(state->worker); // don't care if we fail
+  return 0;
+}
+
+static
+int hadoop_rpc_do_connect(struct connection_state * connection, const char * host, const uint16_t port)
+{
+  int res;
+  struct linger so_linger = {
+    .l_onoff = true,
+    .l_linger = 30
+  };
+
+  connection->sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  connection->servaddr.sin_family = AF_INET;
+  connection->servaddr.sin_addr.s_addr = inet_addr(host);
+  connection->servaddr.sin_port = htons(port);
+
+  res = connect(connection->sockfd, (struct sockaddr *) &connection->servaddr, sizeof(connection->servaddr));
+  if(res < 0)
+  {
+    return res;
+  }
+
+  res = setsockopt(
+    connection->sockfd,
+    SOL_SOCKET,
+    SO_LINGER,
+    &so_linger,
+    sizeof(so_linger));
+  if(res < 0)
+  {
+    return res;
+  }
+
   return 0;
 }
 
@@ -257,12 +291,7 @@ hadoop_rpc_connect_namenode(struct namenode_state * state, const char * host, co
 
   pthread_mutex_lock(&connection->mutex);
 
-  connection->sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  connection->servaddr.sin_family = AF_INET;
-  connection->servaddr.sin_addr.s_addr = inet_addr(host);
-  connection->servaddr.sin_port = htons(port);
-
-  error = connect(connection->sockfd, (struct sockaddr *) &connection->servaddr, sizeof(connection->servaddr));
+  error = hadoop_rpc_do_connect(connection, host, port);
   if(error < 0)
   {
     goto fail;
@@ -344,24 +373,16 @@ fail:
 int
 hadoop_rpc_connect_datanode(struct connection_state * state, const char * host, const uint16_t port)
 {
-  int res;
-
-  state->sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  state->servaddr.sin_family = AF_INET;
-  state->servaddr.sin_addr.s_addr = inet_addr(host);
-  state->servaddr.sin_port = htons(port);
-
-  res = connect(state->sockfd, (struct sockaddr *) &state->servaddr, sizeof(state->servaddr));
+  int res = hadoop_rpc_do_connect(state, host, port);
 
 #ifndef NDEBUG
   syslog(
     LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "hadoop_rpc_connect_datanode, to %s:%u => %zd",
+    "hadoop_rpc_connect_datanode, to %s:%u => %d",
     host,
     port,
     res);
 #endif
-
   state->isconnected = res == 0;
   return res;
 }
