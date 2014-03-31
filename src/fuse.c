@@ -888,6 +888,8 @@ int hadoop_fuse_readdir(const char * path, void * buf, fuse_fill_dir_t filler, o
   int res;
   Hadoop__Hdfs__GetListingRequestProto request = HADOOP__HDFS__GET_LISTING_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__GetListingResponseProto * response = NULL;
+  char * filename = NULL;
+  size_t filenamelen = 0;
 
   request.src = (char *) path;
   request.startafter.len = 0;
@@ -905,7 +907,6 @@ int hadoop_fuse_readdir(const char * path, void * buf, fuse_fill_dir_t filler, o
     struct stat stbuf;
     Hadoop__Hdfs__HdfsFileStatusProto * file = response->dirlist->partiallisting[i];
     struct stat * forfuse;
-    char * filename;
 
     if(file)
     {
@@ -918,7 +919,20 @@ int hadoop_fuse_readdir(const char * path, void * buf, fuse_fill_dir_t filler, o
       forfuse = NULL;
     }
 
-    filename = alloca(file->path.len + 1);
+    if(filenamelen < file->path.len + 1)
+    {
+      //need more space
+      filenamelen = file->path.len + 1;
+
+      if(filename)
+      {
+        filename = realloc(filename, filenamelen);
+      }
+      else
+      {
+        filename = malloc(filenamelen);
+      }
+    }
     filename[file->path.len] = '\0';
     strncpy(filename, (const char *) file->path.data, file->path.len);
     int filled = filler(buf, filename, forfuse, 0);
@@ -926,6 +940,11 @@ int hadoop_fuse_readdir(const char * path, void * buf, fuse_fill_dir_t filler, o
     {
       return -ENOMEM;
     }
+  }
+
+  if(filename)
+  {
+    free(filename);
   }
 
   hadoop__hdfs__get_listing_response_proto__free_unpacked(response, NULL);
@@ -1019,12 +1038,11 @@ int hadoop_fuse_open(const char * path, struct fuse_file_info * fi)
   }
 
   // set up our file handle info
-  fh = malloc(sizeof(*fh));
+  fh = calloc(1, sizeof(*fh));
   if(!fh)
   {
     return -ENOMEM;
   }
-  memset(fh, 0, sizeof(*fh));
   fi->fh = (uint64_t) fh;
   fh->fileid = fileid;
   fh->blocksize = blocksize;
