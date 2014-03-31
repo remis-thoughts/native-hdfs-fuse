@@ -307,13 +307,6 @@ int hadoop_fuse_lock(
   hadoop__hdfs__append_response_proto__free_unpacked(appendresponse, NULL);
 
 end:
-#ifndef NDEBUG
-  syslog(
-    LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "hadoop_fuse_lock appending to %s => %zd",
-    src,
-    res);
-#endif
   return res;
 }
 
@@ -447,10 +440,11 @@ int hadoop_fuse_do_write(
   Hadoop__Hdfs__LocatedBlocksProto * locations,
   Hadoop__Hdfs__ExtendedBlockProto ** last)
 {
-  int res;
+  int res = 0;
   Hadoop__Hdfs__ChecksumProto checksum = HADOOP__HDFS__CHECKSUM_PROTO__INIT;
   uint32_t numblocks;
   uint64_t byteswritten = 0;
+
   assert(fh);
   assert(fh->blocksize);
 
@@ -508,20 +502,6 @@ int hadoop_fuse_do_write(
         goto endwrite;
       }
 
-#ifndef NDEBUG
-      syslog(
-        LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-        "hadoop_fuse_do_write got version %llu for block %s blk_%llu_%llu on %zd node(s) (writing %llu bytes to block offset %llu, file offset %llu)",
-        updateblockresponse->block->b->generationstamp,
-        block->b->poolid,
-        block->b->blockid,
-        block->b->generationstamp,
-        block->n_locs,
-        writetothisblock,
-        offsetintoblock,
-        offsetintofile);
-#endif
-
       res = hadoop_fuse_write_block(
         data ? (data + byteswritten) : NULL,
         offsetintoblock,
@@ -559,6 +539,22 @@ int hadoop_fuse_do_write(
       hadoop_fuse_clone_block(updateblockresponse->block->b, last);
 
 endwrite:
+#ifndef NDEBUG
+      syslog(
+        LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+        "hadoop_fuse_do_write wrote new version %llu for block %s blk_%llu_%llu on %zd node(s) writing %llu bytes to block offset %llu, file offset %llu, block is %llu-%llu => %d",
+        updateblockresponse ? updateblockresponse->block->b->generationstamp : 0,
+        block->b->poolid,
+        block->b->blockid,
+        block->b->generationstamp,
+        block->n_locs,
+        writetothisblock,
+        offsetintoblock,
+        offsetintofile,
+        blockstart,
+        blockend,
+        res);
+#endif
       if(updateblockresponse)
       {
         hadoop__hdfs__update_block_for_pipeline_response_proto__free_unpacked(updateblockresponse, NULL);
@@ -569,7 +565,7 @@ endwrite:
       }
       if(res < 0)
       {
-        return res;
+        break; // stop writing blocks
       }
       else
       {
@@ -580,7 +576,7 @@ endwrite:
 
   // (4) if we've still got some more to write, keep tacking on blocks
   //     and filling them
-  while(byteswritten < len)
+  while(byteswritten < len && res >= 0)
   {
     Hadoop__Hdfs__AddBlockRequestProto block_request = HADOOP__HDFS__ADD_BLOCK_REQUEST_PROTO__INIT;
     Hadoop__Hdfs__AddBlockResponseProto * block_response = NULL;
@@ -597,7 +593,7 @@ endwrite:
     res = CALL_NN("addBlock", block_request, block_response);
     if(res < 0)
     {
-      return res;
+      break;
     }
 
     res = hadoop_fuse_write_block(
@@ -621,29 +617,37 @@ endwrite:
       abandon_request.b = block_response->block->b;
 
       CALL_NN("abandonBlock", abandon_request, abandon_response); // ignore return value.
-
-      hadoop__hdfs__add_block_response_proto__free_unpacked(block_response, NULL);
-      return res;
+      if(abandon_response)
+      {
+        hadoop__hdfs__abandon_block_response_proto__free_unpacked(abandon_response, NULL);
+      }
     }
-
+    else
+    {
 #ifndef NDEBUG
-    syslog(
-      LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_do_write added new block %s blk_%llu_%llu on %zd node(s) (writing %llu bytes to block offset 0)",
-      block_response->block->b->poolid,
-      block_response->block->b->blockid,
-      block_response->block->b->generationstamp,
-      block_response->block->n_locs,
-      writetothisblock);
+      syslog(
+        LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+        "hadoop_fuse_do_write added new block %s blk_%llu_%llu on %zd node(s) after %s blk_%llu_%llu & wrote %llu bytes to block offset 0 (original length %llu) => %d",
+        block_response->block->b->poolid,
+        block_response->block->b->blockid,
+        block_response->block->b->generationstamp,
+        block_response->block->n_locs,
+        *last ? (*last)->poolid : "",
+        *last ? (*last)->blockid : 0,
+        *last ? (*last)->generationstamp : 0,
+        writetothisblock,
+        locations->filelength,
+        res);
 #endif
 
-    byteswritten += writetothisblock;
-    hadoop_fuse_clone_block(block_response->block->b, last);
+      byteswritten += writetothisblock;
+      hadoop_fuse_clone_block(block_response->block->b, last);
+    }
 
     hadoop__hdfs__add_block_response_proto__free_unpacked(block_response, NULL);
   }
 
-  return 0;
+  return res;
 }
 
 // FUSE OPERATIONS -------------------------------------------
@@ -1097,29 +1101,6 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
   struct Hadoop_Fuse_FileHandle * fh = (struct Hadoop_Fuse_FileHandle *) fi->fh;
   uint64_t oldlength;
   uint64_t newlength = offset;
-  bool locked = false;
-
-#define LOCK() \
-  do \
-  { \
-    res = hadoop_fuse_lock(path, &last); \
-    if(res < 0) \
-    { \
-      goto end; \
-    } \
-    locked = true; \
-  } while(false)
-
-#define UNLOCK() \
-  do \
-  { \
-    res = hadoop_fuse_complete(path, fh->fileid, last); \
-    if(res < 0) \
-    { \
-      goto end; \
-    } \
-    locked = false; \
-  } while(false)
 
   assert(offset >= 0);
 
@@ -1152,71 +1133,90 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
       oldlength);
 #endif
 
-    LOCK();
-
-    res = hadoop_fuse_do_write(
+    res = hadoop_fuse_write(
       path,
       NULL, // append \0s
       newlength - oldlength,
       oldlength,
-      (struct Hadoop_Fuse_FileHandle *) fi->fh,
-      response->locations,
-      &last);
+      fi);
     if(res < 0)
     {
       goto end;
     }
+  }
+  else if(newlength == oldlength)
+  {
+#ifndef NDEBUG
+    syslog(
+      LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+      "hadoop_fuse_ftruncate making no changes to %s (size %llu)",
+      path,
+      oldlength);
+#endif
+    goto end;
   }
   else
   {
     // put the abandon block messages here as we may make more than one call
     Hadoop__Hdfs__AbandonBlockRequestProto abandon_request = HADOOP__HDFS__ABANDON_BLOCK_REQUEST_PROTO__INIT;
     Hadoop__Hdfs__AbandonBlockResponseProto * abandon_response = NULL;
+    char * byteskept = NULL;
+    uint64_t bytestokeep = 0;
+    uint64_t bytesoffset = 0;
+    bool locked = false;
 
     abandon_request.src = (char *) path;
     abandon_request.holder = hadoop_fuse_client_name();
 
-    for(uint32_t b = response->locations->n_blocks; b > 0; --b)
+    for(uint32_t b = 0; b < response->locations->n_blocks; ++b)
     {
-      Hadoop__Hdfs__LocatedBlockProto * block = response->locations->blocks[b - 1];
-      uint64_t bytestokeep = max(newlength - block->offset, 0); // can be greater than a block size
-      char * byteskept = NULL;
+      Hadoop__Hdfs__LocatedBlockProto * block = response->locations->blocks[b];
+      uint64_t blockstart = block->offset;
+      uint64_t blockend = blockstart + block->b->numbytes;
 
-      if(block->b->numbytes <= bytestokeep)
+      if(blockend < newlength)
       {
-        // we need the whole of this block, and since we're iterating
-        // through the file backwards we need all subsequent blocks.
-        break;
+        // we need the whole of this block...
+        continue;
       }
 
-      if(bytestokeep > 0)
+      if(blockstart < newlength)
       {
+        // we need some bits of this block
+        bytestokeep = newlength - blockstart;
+
         // we need a bit of this block (this block of code should
         // only be executed for one of the blocks in the file). However,
         // HDFS blocks are append-only so we have to get the data we want
         // to preserve, abandon the old (longer) block, add a new (shorter)
         // block and put the data back.
         byteskept = malloc(bytestokeep);
-
-        // we can't read while the file's locked
-        if(locked)
+        if(!byteskept)
         {
-          UNLOCK();
+          res = -ENOMEM;
+          goto end;
         }
+
         res = hadoop_fuse_read(path, byteskept, bytestokeep, block->offset, fi);
         if(res < 0)
         {
           goto end;
         }
+        bytesoffset = blockstart; // where to put them back
+      }
+
+      if(!locked)
+      {
+        res = hadoop_fuse_lock(path, &last);
+        if(res < 0)
+        {
+          goto end;
+        }
+        locked = true;
       }
 
       // Toss the current block
       abandon_request.b = block->b;
-
-      if(!locked)
-      {
-        LOCK();
-      }
 
 #ifndef NDEBUG
       syslog(
@@ -1239,23 +1239,31 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
       }
       hadoop__hdfs__abandon_block_response_proto__free_unpacked(abandon_response, NULL);
       hadoop_fuse_clone_block(NULL, &last); // the "last" block isn't a part of the file any more
+    }
 
-      if(bytestokeep > 0)
+    assert(locked);
+
+    if(byteskept)
+    {
+      res = hadoop_fuse_do_write(
+        path,
+        byteskept,
+        bytestokeep,
+        bytesoffset,
+        (struct Hadoop_Fuse_FileHandle *) fi->fh,
+        NULL, // we don't care about the old locations as we're appending a new block.
+        &last);
+      free(byteskept);
+      if(res < 0)
       {
-        res = hadoop_fuse_do_write(
-          path,
-          byteskept,
-          bytestokeep,
-          block->offset,
-          (struct Hadoop_Fuse_FileHandle *) fi->fh,
-          NULL, // we don't care about the old locations as we're appending a new block.
-          &last);
-        free(byteskept);
-        if(res < 0)
-        {
-          goto end;
-        }
+        goto end;
       }
+    }
+
+    res = hadoop_fuse_complete(path, fh->fileid, last);
+    if(res < 0)
+    {
+      goto end;
     }
   }
 
@@ -1263,10 +1271,6 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
   res = 0;
 
 end:
-  if(locked)
-  {
-    UNLOCK();
-  }
   hadoop__hdfs__get_block_locations_response_proto__free_unpacked(response, NULL);
   if(last)
   {
