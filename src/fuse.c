@@ -636,7 +636,7 @@ endwrite:
         *last ? (*last)->blockid : 0,
         *last ? (*last)->generationstamp : 0,
         writetothisblock,
-        locations->filelength,
+        locations ? locations->filelength : 0,
         res);
 #endif
 
@@ -1101,6 +1101,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
   struct Hadoop_Fuse_FileHandle * fh = (struct Hadoop_Fuse_FileHandle *) fi->fh;
   uint64_t oldlength;
   uint64_t newlength = offset;
+  uint32_t n_blocks;
 
   assert(offset >= 0);
 
@@ -1118,6 +1119,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
     goto end;
   }
   oldlength = response->locations->filelength;
+  n_blocks = response->locations ? response->locations->n_blocks : 0;
 
   if(newlength > oldlength)
   {
@@ -1157,18 +1159,12 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
   }
   else
   {
-    // put the abandon block messages here as we may make more than one call
-    Hadoop__Hdfs__AbandonBlockRequestProto abandon_request = HADOOP__HDFS__ABANDON_BLOCK_REQUEST_PROTO__INIT;
-    Hadoop__Hdfs__AbandonBlockResponseProto * abandon_response = NULL;
     char * byteskept = NULL;
     uint64_t bytestokeep = 0;
     uint64_t bytesoffset = 0;
-    bool locked = false;
+    uint32_t lastkeptblock = n_blocks;
 
-    abandon_request.src = (char *) path;
-    abandon_request.holder = hadoop_fuse_client_name();
-
-    for(uint32_t b = 0; b < response->locations->n_blocks; ++b)
+    for(uint32_t b = 0; b < n_blocks; ++b)
     {
       Hadoop__Hdfs__LocatedBlockProto * block = response->locations->blocks[b];
       uint64_t blockstart = block->offset;
@@ -1177,6 +1173,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
       if(blockend < newlength)
       {
         // we need the whole of this block...
+        lastkeptblock = b;
         continue;
       }
 
@@ -1205,43 +1202,101 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
         bytesoffset = blockstart; // where to put them back
       }
 
-      if(!locked)
+      break;
+    }
+
+    if(lastkeptblock == n_blocks)
+    {
+      // we're dropping all of them
+      Hadoop__Hdfs__GetFileInfoRequestProto filerequest = HADOOP__HDFS__GET_FILE_INFO_REQUEST_PROTO__INIT;
+      Hadoop__Hdfs__GetFileInfoResponseProto * fileresponse = NULL;
+      Hadoop__Hdfs__CreateRequestProto overwriterequest = HADOOP__HDFS__CREATE_REQUEST_PROTO__INIT;
+      Hadoop__Hdfs__CreateResponseProto * overwriteresponse = NULL;
+
+      filerequest.src = (char *) path;
+      res = CALL_NN("getFileInfo", filerequest, fileresponse);
+      if(res < 0)
       {
-        res = hadoop_fuse_lock(path, &last);
-        if(res < 0)
-        {
-          goto end;
-        }
-        locked = true;
+        return res;
       }
 
-      // Toss the current block
-      abandon_request.b = block->b;
+      overwriterequest.src = (char *) path;
+      overwriterequest.clientname = hadoop_fuse_client_name();
+      overwriterequest.createparent = false;
+      overwriterequest.masked = fileresponse->fs->permission;
+      overwriterequest.createflag = HADOOP__HDFS__CREATE_FLAG_PROTO__OVERWRITE; // must already exist
+      overwriterequest.replication = fileresponse->fs->block_replication;
+      overwriterequest.blocksize = fileresponse->fs->blocksize;
 
 #ifndef NDEBUG
       syslog(
         LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-        "hadoop_fuse_ftruncate, dropping block %s blk_%llu_%llu of %s as start %llu + len %llu >= new len %llu (keeping %llu bytes)",
-        block->b->poolid,
-        block->b->blockid,
-        block->b->generationstamp,
-        path,
-        block->offset,
-        oldlength,
-        newlength,
-        bytestokeep);
+        "hadoop_fuse_ftruncate, overwriting %s",
+        path);
 #endif
 
-      res = CALL_NN("abandonBlock", abandon_request, abandon_response);
+      res = CALL_NN("create", overwriterequest, overwriteresponse);
+      hadoop__hdfs__get_file_info_response_proto__free_unpacked(fileresponse, NULL);
+      if(res < 0)
+      {
+        return res;
+      }
+      if(overwriteresponse->fs->has_fileid)
+      {
+        fh->fileid = overwriteresponse->fs->fileid;
+      }
+      hadoop__hdfs__create_response_proto__free_unpacked(overwriteresponse, NULL);
+
+      hadoop_fuse_clone_block(NULL, &last);
+    }
+    else
+    {
+      // put the abandon block messages here as we may make more than one call
+      Hadoop__Hdfs__AbandonBlockRequestProto abandon_request = HADOOP__HDFS__ABANDON_BLOCK_REQUEST_PROTO__INIT;
+      Hadoop__Hdfs__AbandonBlockResponseProto * abandon_response = NULL;
+
+      abandon_request.src = (char *) path;
+      abandon_request.holder = hadoop_fuse_client_name();
+
+      // we need to lock the file to drop blocks, and we'll always drop
+      // at least one block as the new size is strictly less than the old
+      // size.
+      res = hadoop_fuse_lock(path, &last);
       if(res < 0)
       {
         goto end;
       }
-      hadoop__hdfs__abandon_block_response_proto__free_unpacked(abandon_response, NULL);
-      hadoop_fuse_clone_block(NULL, &last); // the "last" block isn't a part of the file any more
-    }
 
-    assert(locked);
+      for(uint32_t b = n_blocks - 1; b > lastkeptblock; --b)
+      {
+        Hadoop__Hdfs__LocatedBlockProto * block = response->locations->blocks[b];
+
+        abandon_request.b = block->b;
+
+#ifndef NDEBUG
+        syslog(
+          LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+          "hadoop_fuse_ftruncate, dropping block %s blk_%llu_%llu of %s as start %llu + len %llu >= new len %llu (keeping %llu bytes)",
+          block->b->poolid,
+          block->b->blockid,
+          block->b->generationstamp,
+          path,
+          block->offset,
+          block->b->numbytes,
+          newlength,
+          bytestokeep);
+#endif
+
+        res = CALL_NN("abandonBlock", abandon_request, abandon_response);
+        if(res < 0)
+        {
+          goto end;
+        }
+        hadoop__hdfs__abandon_block_response_proto__free_unpacked(abandon_response, NULL);
+      }
+
+      hadoop_fuse_clone_block(response->locations->blocks[lastkeptblock]->b, &last);
+    }
 
     if(byteskept)
     {
@@ -1299,6 +1354,8 @@ int hadoop_fuse_write(
   Hadoop__Hdfs__GetBlockLocationsResponseProto * response = NULL;
   Hadoop__Hdfs__ExtendedBlockProto * last = NULL;
   struct Hadoop_Fuse_FileHandle * fh = (struct Hadoop_Fuse_FileHandle *) fi->fh;
+  uint64_t offsetintofile = offset;
+  uint32_t n_blocks;
 
   request.src = (char *) src;
   request.offset = 0;
@@ -1314,6 +1371,7 @@ int hadoop_fuse_write(
     error = -ENOENT;
     goto end;
   }
+  n_blocks = response->locations->n_blocks;
 
   res = hadoop_fuse_lock(src, &last);
   if(res < 0)
@@ -1322,20 +1380,28 @@ int hadoop_fuse_write(
     goto end;
   }
 
-  res = hadoop_fuse_do_write(
-    src,
-    data,
-    len,
-    (uint64_t) offset,
-    fh,
-    response->locations,
-    &last);
-  if(res < 0)
+  if(n_blocks == 0 || offsetintofile >= response->locations->blocks[n_blocks - 1]->offset)
   {
-    error = res;
-    // the write failed, but we still need to unlock the file by
-    // "completing" it.
-    // goto end;
+    // the easy case: we're modifying the last block
+    res = hadoop_fuse_do_write(
+      src,
+      data,
+      len,
+      offsetintofile,
+      fh,
+      response->locations,
+      &last);
+    if(res < 0)
+    {
+      error = res;
+      // the write failed, but we still need to unlock the file by
+      // "completing" it.
+      // goto end;
+    }
+  }
+  else
+  {
+    assert(false);
   }
 
   // persist the data we've just written, & release the lease we have on "src"

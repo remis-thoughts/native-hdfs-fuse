@@ -11,7 +11,13 @@ proto: proto/*.proto
 
 CCFLAGS := $(shell pkg-config --cflags --libs fuse libprotobuf-c) -Werror -Wall -Wextra -I.
 
-all:
+build/fuse-dfs-proto: src/*.c src/*.h
 	mkdir -p build
 	$(UNCRUSTIFY) proto/*.[ch] src/*.[ch]
-	$(CC) -o build/fuse-dfs-proto proto/*.c src/*.c $(CCFLAGS) -g
+	$(CC) -o build/fuse-dfs-proto proto/*.c src/*.c $(CCFLAGS)
+
+all: CC += -DNDEBUG
+all: build/fuse-dfs-proto
+
+debug: CC += -DDEBUG -g3
+debug: build/fuse-dfs-proto
