@@ -480,7 +480,7 @@ int hadoop_fuse_do_write(
   assert(bufferpos->bufferoffset == 0);
 
   // set up the checksum algorithm we'll use to transfer the data
-  checksum.type = HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_NULL;
+  checksum.type = hadoop_fuse_namenode_state()->checksumtype;
   checksum.bytesperchecksum = hadoop_fuse_namenode_state()->bytesperchecksum;
 
   if(lastlocation && offsetintofile < lastlocation->offset + fh->blocksize && offsetintofile >= lastlocation->offset)

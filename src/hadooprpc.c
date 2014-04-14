@@ -2,6 +2,7 @@
 #include "hadooprpc.h"
 #include "varint.h"
 #include "minmax.h"
+#include "roundup.h"
 
 #include "proto/IpcConnectionContext.pb-c.h"
 #include "proto/ProtobufRpcEngine.pb-c.h"
@@ -26,6 +27,8 @@ int hadoop_rpc_disconnect(struct connection_state * state);
 
 static
 int hadoop_rpc_disconnect_namenode(struct namenode_state * state);
+
+uint32_t crc32c(uint32_t crc, const void * buf, size_t len);
 
 // -----------------------------------------------------------
 
@@ -606,16 +609,35 @@ int hadoop_rpc_send_packet(
   //            checksums were not requested
   // DATA       the actual block data
 
-  (void) checksum;
   int res;
   uint32_t packetlen;
   uint16_t headerlen;
+  uint8_t checksumlen; // length of a single checksum
+  uint32_t n_checksums;
   void * headerbuf;
   Hadoop__Hdfs__PacketHeaderProto header = HADOOP__HDFS__PACKET_HEADER_PROTO__INIT;
   Hadoop__Hdfs__PipelineAckProto * ack = NULL;
 
   assert(from);
   assert(len <= from->len - from->bufferoffset); // we must have this much data available
+
+  switch(checksum->type)
+  {
+  case HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_CRC32C:
+    checksumlen = sizeof(uint32_t);
+    break;
+  case HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_CRC32:
+    // CRC32C is the default, TODO: implement this?
+    return -ENOSYS;
+  case HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_NULL:
+    checksumlen = 0;
+    break;
+  default:
+    return -ENOSYS;
+  }
+
+  n_checksums = roundup(len, checksum->bytesperchecksum);
+  packetlen = sizeof(packetlen) + n_checksums * checksumlen + len;
 
   header.seqno = seqno;
   header.offsetinblock = blockoffset;
@@ -624,7 +646,6 @@ int hadoop_rpc_send_packet(
   headerlen = hadoop__hdfs__packet_header_proto__get_packed_size(&header);
   headerbuf = alloca(headerlen);
   hadoop__hdfs__packet_header_proto__pack(&header, headerbuf);
-  packetlen = sizeof(packetlen) + 0 + header.datalen;
 
   res = hadoop_rpc_send_int32(state, packetlen);
   if(res < 0)
@@ -641,45 +662,97 @@ int hadoop_rpc_send_packet(
   {
     goto endpacket;
   }
+
   if(len > 0)
   {
-    size_t idx = 0;
-    size_t written = 0;
+    void * packet = NULL;
 
-    for(uint8_t i = 0; i < from->n_buffers && written < len; ++i)
+    // we need to assemble the packet if it appears across multiple buffers
     {
-      const struct Hadoop_Fuse_Buffer * buffer = from->buffers + i;
+      size_t idx = 0;
+      size_t written = 0;
 
-      if(idx + buffer->len > from->bufferoffset)
+      for(uint8_t i = 0; i < from->n_buffers && written < len; ++i)
       {
-        // we're in the bit of data we want to write
-        off_t offset = idx > from->bufferoffset ? 0 : (from->bufferoffset - idx); // offset into buffer
-        size_t towrite = min(len - written, buffer->len - offset);
+        const struct Hadoop_Fuse_Buffer * buffer = from->buffers + i;
 
-        if(towrite > 0)
+        if(idx + buffer->len > from->bufferoffset)
         {
-          void * data = buffer->data;
+          // we're in the bit of data we want to write
+          off_t offset = idx > from->bufferoffset ? 0 : (from->bufferoffset - idx); // offset into buffer
+          size_t towrite = min(len - written, buffer->len - offset);
 
-          if(!data)
+          if(towrite == len)
           {
-            // we don't have a real buffer to read data from, so make one and fill it with nulls
-            // TODO: could we pass NULLs to sendto without creating this?
-            data = alloca(len);
-            memset(data, 0, len);
-            offset = 0;
+            // we don't need to assemble the packet as it's in a single buffer
+            if(buffer->data)
+            {
+              packet = buffer->data + offset;
+            }
+            else
+            {
+              // we don't have a real buffer to read data from, so make one and fill it with nulls
+              // TODO: could we pass NULLs to sendto without creating this?
+              packet = alloca(len);
+              memset(packet, 0, len);
+            }
+            break;
           }
-
-          res = hadoop_rpc_send(state, data + offset, towrite);
-          if(res < 0)
+          else if(towrite > 0)
           {
-            goto endpacket;
-          }
+            // we need a bit from this buffer and a bit from at least one other one.
 
-          written += towrite;
+            if(!packet)
+            {
+              packet = alloca(len);
+            }
+
+            if(buffer->data)
+            {
+              memcpy(packet + written, buffer->data + offset, towrite);
+            }
+            else
+            {
+              memset(packet + written, 0, towrite);
+            }
+
+            written += towrite;
+          }
+        }
+
+        idx += buffer->len;
+      }
+    }
+
+    if(checksumlen > 0)
+    {
+      // write out the checksums
+
+      assert(checksum->type == HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_CRC32C); // TODO: currently only one implementation
+
+      for(uint32_t i = 0; i < n_checksums; ++i)
+      {
+        uint32_t packetidx = i * checksum->bytesperchecksum;
+
+        res = hadoop_rpc_send_int32(
+          state,
+          crc32c(
+            0, // we're not computing the crc32c incrementally
+            packet + packetidx,
+            min(checksum->bytesperchecksum, len - packetidx)));
+        if(res < 0)
+        {
+          goto endpacket;
         }
       }
-      idx += buffer->len;
     }
+
+    res = hadoop_rpc_send(state, packet, len);
+    if(res < 0)
+    {
+      goto endpacket;
+    }
+
     from->bufferoffset += len;
   }
 
@@ -722,13 +795,14 @@ endpacket:
 #ifndef NDEBUG
   syslog(
     LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "hadoop_rpc_send_packet, %s seqno=%llu |data|=%zd |packet|=%u |header|=%u offset=%zd => %d",
+    "hadoop_rpc_send_packet, %s seqno=%llu |data|=%zd |packet|=%u |header|=%u offset=%zd with %u checksums => %d",
     res < 0 ? "FAILED to send" : "sent",
     seqno,
     len,
     packetlen,
     headerlen,
     blockoffset,
+    n_checksums,
     res);
 #endif
   if(ack)
@@ -741,7 +815,7 @@ endpacket:
 int hadoop_rpc_send_packets(
   struct connection_state * state,
   struct Hadoop_Fuse_Buffer_Pos * from,
-  uint64_t len, // bytes to write
+  uint64_t len,           // bytes to write
   off_t blockoffset,
   uint32_t packetsize,
   const Hadoop__Hdfs__ChecksumProto * checksum)
