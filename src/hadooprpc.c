@@ -584,9 +584,9 @@ static
 int hadoop_rpc_send_packet(
   struct connection_state * state,
   int64_t seqno,
-  uint8_t * from, // can only be NULL if len is 0
+  struct Hadoop_Fuse_Buffer_Pos * from, // or NULL to send zeros
   size_t len, // bytes from "from" to read
-  off_t offset, // offset in packet
+  off_t blockoffset,
   const Hadoop__Hdfs__ChecksumProto * checksum)
 {
   // Each packet looks like:
@@ -614,8 +614,11 @@ int hadoop_rpc_send_packet(
   Hadoop__Hdfs__PacketHeaderProto header = HADOOP__HDFS__PACKET_HEADER_PROTO__INIT;
   Hadoop__Hdfs__PipelineAckProto * ack = NULL;
 
+  assert(from);
+  assert(len <= from->len - from->bufferoffset); // we must have this much data available
+
   header.seqno = seqno;
-  header.offsetinblock = offset;
+  header.offsetinblock = blockoffset;
   header.lastpacketinblock = len == 0;
   header.datalen = len;
   headerlen = hadoop__hdfs__packet_header_proto__get_packed_size(&header);
@@ -638,10 +641,46 @@ int hadoop_rpc_send_packet(
   {
     goto endpacket;
   }
-  res = hadoop_rpc_send(state, from, header.datalen);
-  if(res < 0)
+  if(len > 0)
   {
-    goto endpacket;
+    size_t idx = 0;
+    size_t written = 0;
+
+    for(uint8_t i = 0; i < from->n_buffers && written < len; ++i)
+    {
+      const struct Hadoop_Fuse_Buffer * buffer = from->buffers + i;
+
+      if(idx + buffer->len > from->bufferoffset)
+      {
+        // we're in the bit of data we want to write
+        off_t offset = idx > from->bufferoffset ? 0 : (from->bufferoffset - idx); // offset into buffer
+        size_t towrite = min(len - written, buffer->len - offset);
+
+        if(towrite > 0)
+        {
+          void * data = buffer->data;
+
+          if(!data)
+          {
+            // we don't have a real buffer to read data from, so make one and fill it with nulls
+            // TODO: could we pass NULLs to sendto without creating this?
+            data = alloca(len);
+            memset(data, 0, len);
+            offset = 0;
+          }
+
+          res = hadoop_rpc_send(state, data + offset, towrite);
+          if(res < 0)
+          {
+            goto endpacket;
+          }
+
+          written += towrite;
+        }
+      }
+      idx += buffer->len;
+    }
+    from->bufferoffset += len;
   }
 
   // now get the ack
@@ -683,13 +722,13 @@ endpacket:
 #ifndef NDEBUG
   syslog(
     LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "hadoop_rpc_send_packet, %s %llu |data|=%zd |packet|=%u |header|=%u offset=%zd => %d",
+    "hadoop_rpc_send_packet, %s seqno=%llu |data|=%zd |packet|=%u |header|=%u offset=%zd => %d",
     res < 0 ? "FAILED to send" : "sent",
     seqno,
     len,
     packetlen,
     headerlen,
-    offset,
+    blockoffset,
     res);
 #endif
   if(ack)
@@ -701,51 +740,35 @@ endpacket:
 
 int hadoop_rpc_send_packets(
   struct connection_state * state,
-  uint8_t * from,
-  size_t len,
-  off_t offset,
+  struct Hadoop_Fuse_Buffer_Pos * from,
+  uint64_t len, // bytes to write
+  off_t blockoffset,
   uint32_t packetsize,
   const Hadoop__Hdfs__ChecksumProto * checksum)
 {
   int res;
-  size_t sent = 0;
+  off_t initialbufferoffset = from->bufferoffset;
   int64_t seqno = 0;
-  uint8_t * tosend;
 
-  if(from)
+  while(true)
   {
-    tosend = from;
-  }
-  else
-  {
-    // since we'll use this, we'll make the buffer as big as
-    // we could possibly need.
-    tosend = alloca(packetsize);
-    memset(tosend, 0, packetsize);
-  }
-
-  while(sent < len)
-  {
-    size_t packetlen = len - sent;
-    off_t packetoffset = offset + sent;
+    uint64_t bytessent = from->bufferoffset - initialbufferoffset;
+    size_t packetlen = min(len - bytessent, packetsize);
+    off_t packetoffset = blockoffset + bytessent;
     uint32_t bytespastboundary = packetoffset % checksum->bytesperchecksum;
 
-    if(bytespastboundary != 0)
+    if(packetlen > 0 && bytespastboundary != 0)
     {
       // if we have a "partial" checksum - i.e. we're not starting
       // on a "bytesperchecksum" boundary, we can only have this one
       // (partial) chunk in the packet
       packetlen = checksum->bytesperchecksum - bytespastboundary;
     }
-    else if(packetlen > packetsize)
-    {
-      packetlen = packetsize;
-    }
 
     res = hadoop_rpc_send_packet(
       state,
       seqno++,
-      tosend,
+      from,
       packetlen,
       packetoffset,
       checksum);
@@ -753,29 +776,12 @@ int hadoop_rpc_send_packets(
     {
       return res;
     }
-
-    sent += packetlen;
-    if(from)
+    if(packetlen == 0)
     {
-      // we only need to walk through a data buffer, not the fixed
-      // nu
-      tosend += packetlen;
+      break;
     }
   }
 
-  // sent empty packet to finish
-  res = hadoop_rpc_send_packet(
-    state,
-    seqno++,
-    NULL,
-    0,
-    offset + sent,
-    checksum);
-  if(res < 0)
-  {
-    return res;
-  }
-
-  return 0;
+  return res < 0 ? res : 0;
 }
 

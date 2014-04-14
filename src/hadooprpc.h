@@ -29,6 +29,21 @@ struct namenode_state {
   Hadoop__Hdfs__ChecksumTypeProto checksumtype;
 };
 
+// TODO: use protobuf binary?
+struct Hadoop_Fuse_Buffer
+{
+  char * data; // if NULL, \0s are written
+  size_t len;
+};
+
+struct Hadoop_Fuse_Buffer_Pos
+{
+  const struct Hadoop_Fuse_Buffer * buffers;
+  const uint8_t n_buffers;
+  size_t bufferoffset; // offset into buffers
+  size_t len;
+};
+
 int hadoop_rpc_connect_namenode(
   struct namenode_state * state,
   const char * host,
@@ -62,9 +77,9 @@ int hadoop_rpc_receive_packets(
 
 int hadoop_rpc_send_packets(
   struct connection_state * state,
-  uint8_t * from,
-  size_t len,
-  off_t offset,
+  struct Hadoop_Fuse_Buffer_Pos * from,
+  uint64_t len, // bytes to write
+  off_t blockoffset,
   uint32_t packetsize,
   const Hadoop__Hdfs__ChecksumProto * checksum);
 

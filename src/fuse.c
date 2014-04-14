@@ -215,13 +215,28 @@ int hadoop_fuse_complete(const char * src, uint64_t fileid, Hadoop__Hdfs__Extend
   }
 
 #ifndef NDEBUG
-  syslog(
-    LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "hadoop_fuse_complete %s (fileid %llu) last block length = %llu => %zd",
-    src,
-    fileid,
-    last ? last->numbytes : 0,
-    res);
+  if(last)
+  {
+    syslog(
+      LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+      "hadoop_fuse_complete %s (fileid %llu) last block %s blk_%llu_%llu (length = %llu) => %d",
+      src,
+      fileid,
+      last->poolid,
+      last->blockid,
+      last->generationstamp,
+      last->numbytes,
+      res);
+  }
+  else
+  {
+    syslog(
+      LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+      "hadoop_fuse_complete %s (fileid %llu) with NO last block => %d",
+      src,
+      fileid,
+      res);
+  }
 #endif
 
   return res;
@@ -297,24 +312,28 @@ int hadoop_fuse_lock(
   {
     hadoop_fuse_clone_block(appendresponse->block->b, last);
   }
-  else
-  {
-    // not an error, e.g. if the file has no blocks yet
-    *last = NULL;
-  }
 
   res = 0;
   hadoop__hdfs__append_response_proto__free_unpacked(appendresponse, NULL);
 
 end:
+
+#ifndef NDEBUG
+  syslog(
+    LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+    "hadoop_fuse_lock %s => %d",
+    src,
+    res);
+#endif
+
   return res;
 }
 
 static
 int hadoop_fuse_write_block(
-  const char * data, // if NULL, "len" \0s are written
-  const off_t offset, // offset into block
-  const size_t len, // len of data
+  struct Hadoop_Fuse_Buffer_Pos * bufferpos,
+  const uint64_t len, // bytes to write
+  const off_t blockoffset, // offset into block
   const Hadoop__Hdfs__ChecksumProto * checksum,
   const Hadoop__Hdfs__LocatedBlockProto * block,
   Hadoop__Hdfs__LocatedBlockProto * newblock)
@@ -325,10 +344,10 @@ int hadoop_fuse_write_block(
   Hadoop__Hdfs__OpWriteBlockProto oprequest = HADOOP__HDFS__OP_WRITE_BLOCK_PROTO__INIT;
   Hadoop__Hdfs__BlockOpResponseProto * opresponse = NULL;
   bool written = false;
-  uint64_t newblocklen = max(newblock->b->has_numbytes ? newblock->b->numbytes : 0, offset + len);
+  uint64_t newblocklen = max(newblock->b->has_numbytes ? newblock->b->numbytes : 0, blockoffset + len);
 
-  assert(len > 0);
-  assert(offset >= 0);
+  assert(bufferpos->len > 0);
+  assert(bufferpos->bufferoffset >= 0);
   assert(block->n_locs > 0);
 
   clientheader.clientname = hadoop_fuse_client_name();
@@ -385,9 +404,9 @@ int hadoop_fuse_write_block(
       hadoop__hdfs__block_op_response_proto__free_unpacked(opresponse, NULL);
       res = hadoop_rpc_send_packets(
         &dn_state,
-        (uint8_t *) data,
+        bufferpos,
         len,
-        offset,
+        blockoffset,
         hadoop_fuse_namenode_state()->packetsize,
         checksum);
       written = res == 0;
@@ -397,10 +416,10 @@ int hadoop_fuse_write_block(
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_write_block, %s %zd bytes (offset %zd) of block %s blk_%llu_%llu (was: %llu, now: %lli) to DN %s:%d (%zd of %zd) => %d",
+      "hadoop_fuse_write_block, %s %llu bytes to block offset %llu of block %s blk_%llu_%llu (was: %llu, now: %llu) to DN %s:%d (%zd of %zd) => %d",
       (written ? "written" : "NOT written"),
       len,
-      offset,
+      blockoffset,
       block->b->poolid,
       block->b->blockid,
       newblock->b->generationstamp,
@@ -427,160 +446,140 @@ int hadoop_fuse_write_block(
   }
 }
 
+static inline
+uint64_t hadoop_fuse_bytestowrite(
+  const struct Hadoop_Fuse_Buffer_Pos * bufferpos,
+  const uint64_t blockoffset,
+  const struct Hadoop_Fuse_FileHandle * fh)
+{
+  return min(fh->blocksize - blockoffset, bufferpos->len - bufferpos->bufferoffset);
+}
+
 /**
- * Assumes file is locked
+ * Assumes file is locked, and offsetintofile is in the (under construction)
+ * last block of the file. offsetintofile must also be contiguous, i.e. at most
+ * current file length + 1
  */
 static
 int hadoop_fuse_do_write(
   const char * src,
-  const char * const data,
-  const size_t len,
+  struct Hadoop_Fuse_Buffer_Pos * bufferpos,
   const uint64_t offsetintofile,
-  struct Hadoop_Fuse_FileHandle * fh,
-  Hadoop__Hdfs__LocatedBlocksProto * locations,
+  const struct Hadoop_Fuse_FileHandle * fh,
+  const Hadoop__Hdfs__LocatedBlockProto * lastlocation,
   Hadoop__Hdfs__ExtendedBlockProto ** last)
 {
   int res = 0;
   Hadoop__Hdfs__ChecksumProto checksum = HADOOP__HDFS__CHECKSUM_PROTO__INIT;
-  uint32_t numblocks;
-  uint64_t byteswritten = 0;
 
   assert(fh);
   assert(fh->blocksize);
+  assert(!lastlocation || lastlocation->offset <= offsetintofile);
+  assert(!lastlocation || lastlocation->b->has_numbytes); // not sure where to get this from otherwise
+  assert(bufferpos);
+  assert(bufferpos->bufferoffset == 0);
 
-  numblocks = locations ? locations->n_blocks : 0;
-
-  // (2) set up the checksum algorithm we'll use to transfer the data
+  // set up the checksum algorithm we'll use to transfer the data
   checksum.type = HADOOP__HDFS__CHECKSUM_TYPE_PROTO__CHECKSUM_NULL;
   checksum.bytesperchecksum = hadoop_fuse_namenode_state()->bytesperchecksum;
 
-  // (3) loop through the blocks, seeing if we have to overwrite any.
-  for(size_t b = 0; b < numblocks; ++b)
+  if(lastlocation && offsetintofile < lastlocation->offset + fh->blocksize && offsetintofile >= lastlocation->offset)
   {
-    Hadoop__Hdfs__LocatedBlockProto * block = locations->blocks[b];
-    uint64_t blockstart = block->offset;
-    uint64_t blockend;
-    uint64_t writetothisblock;
-    uint64_t offsetintoblock = max(offsetintofile - blockstart, 0);
+    Hadoop__Hdfs__UpdateBlockForPipelineRequestProto updateblockrequest = HADOOP__HDFS__UPDATE_BLOCK_FOR_PIPELINE_REQUEST_PROTO__INIT;
+    Hadoop__Hdfs__UpdateBlockForPipelineResponseProto * updateblockresponse = NULL;
+    Hadoop__Hdfs__UpdatePipelineRequestProto updaterequest = HADOOP__HDFS__UPDATE_PIPELINE_REQUEST_PROTO__INIT;
+    Hadoop__Hdfs__UpdatePipelineResponseProto * updateresponse = NULL;
+    Hadoop__Hdfs__DatanodeIDProto ** newnodes = NULL;
+    uint64_t blockoffset = offsetintofile - lastlocation->offset;
+    uint64_t len = hadoop_fuse_bytestowrite(bufferpos, blockoffset, fh);
 
-    assert(block->b->has_numbytes); // not sure where to get this from otherwise
+    updateblockrequest.clientname = hadoop_fuse_client_name();
+    updateblockrequest.block = lastlocation->b;
 
-    if(b == numblocks - 1)
+    // since we're updating a block, we need to get a new "generation stamp" (version)
+    // from the NN.
+    res = CALL_NN("updateBlockForPipeline", updateblockrequest, updateblockresponse);
+    if(res < 0)
     {
-      // the last block
-      blockend = blockstart + fh->blocksize;
-    }
-    else
-    {
-      blockend = blockstart + block->b->numbytes;
-    }
-
-    if(offsetintofile > blockend || offsetintofile + len < blockstart)
-    {
-      // definitely not here:
-      continue;
+      goto endwrite;
     }
 
-    writetothisblock = min(blockend - max(offsetintofile + byteswritten, blockstart), len - byteswritten);
-
-    if(writetothisblock > 0)
+    res = hadoop_fuse_write_block(
+      bufferpos,
+      len,
+      blockoffset,
+      &checksum,
+      lastlocation,
+      updateblockresponse->block);
+    if(res < 0)
     {
-      Hadoop__Hdfs__UpdateBlockForPipelineRequestProto updateblockrequest = HADOOP__HDFS__UPDATE_BLOCK_FOR_PIPELINE_REQUEST_PROTO__INIT;
-      Hadoop__Hdfs__UpdateBlockForPipelineResponseProto * updateblockresponse = NULL;
-      Hadoop__Hdfs__UpdatePipelineRequestProto updaterequest = HADOOP__HDFS__UPDATE_PIPELINE_REQUEST_PROTO__INIT;
-      Hadoop__Hdfs__UpdatePipelineResponseProto * updateresponse = NULL;
-      Hadoop__Hdfs__DatanodeIDProto ** newnodes = NULL;
+      goto endwrite;
+    }
 
-      updateblockrequest.clientname = hadoop_fuse_client_name();
-      updateblockrequest.block = block->b;
+    // tell the NN we've updated the block
 
-      // since we're updating a block, we need to get a new "generation stamp" (version)
-      // from the NN.
-      res = CALL_NN("updateBlockForPipeline", updateblockrequest, updateblockresponse);
-      if(res < 0)
-      {
-        goto endwrite;
-      }
+    newnodes = alloca(lastlocation->n_locs * sizeof(Hadoop__Hdfs__DatanodeIDProto *));
+    for(size_t n = 0; n < lastlocation->n_locs; ++n)
+    {
+      newnodes[n] = lastlocation->locs[n]->id;
+    }
 
-      res = hadoop_fuse_write_block(
-        data ? (data + byteswritten) : NULL,
-        offsetintoblock,
-        writetothisblock,
-        &checksum,
-        block,
-        updateblockresponse->block);
-      if(res < 0)
-      {
-        goto endwrite;
-      }
+    updaterequest.clientname = hadoop_fuse_client_name();
+    updaterequest.oldblock = lastlocation->b;
+    updaterequest.newblock = updateblockresponse->block->b;
+    updaterequest.n_newnodes = lastlocation->n_locs;
+    updaterequest.newnodes = newnodes;
+    updaterequest.n_storageids = lastlocation->n_storageids;
+    updaterequest.storageids = lastlocation->storageids;
 
-      // tell the NN we've updated the block
+    res = CALL_NN("updatePipeline", updaterequest, updateresponse);
+    if(res < 0)
+    {
+      goto endwrite;
+    }
 
-      newnodes = alloca(block->n_locs * sizeof(*newnodes));
-      for(size_t n = 0; n < block->n_locs; ++n)
-      {
-        newnodes[n] = block->locs[n]->id;
-      }
-
-      updaterequest.clientname = hadoop_fuse_client_name();
-      updaterequest.oldblock = block->b;
-      updaterequest.newblock = updateblockresponse->block->b;
-      updaterequest.n_newnodes = block->n_locs;
-      updaterequest.newnodes = newnodes;
-      updaterequest.n_storageids = block->n_storageids;
-      updaterequest.storageids = block->storageids;
-
-      res = CALL_NN("updatePipeline", updaterequest, updateresponse);
-      if(res < 0)
-      {
-        goto endwrite;
-      }
-
-      hadoop_fuse_clone_block(updateblockresponse->block->b, last);
+    hadoop_fuse_clone_block(updateblockresponse->block->b, last);
 
 endwrite:
 #ifndef NDEBUG
-      syslog(
-        LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-        "hadoop_fuse_do_write wrote new version %llu for block %s blk_%llu_%llu on %zd node(s) writing %llu bytes to block offset %llu, file offset %llu, block is %llu-%llu => %d",
-        updateblockresponse ? updateblockresponse->block->b->generationstamp : 0,
-        block->b->poolid,
-        block->b->blockid,
-        block->b->generationstamp,
-        block->n_locs,
-        writetothisblock,
-        offsetintoblock,
-        offsetintofile,
-        blockstart,
-        blockend,
-        res);
+    syslog(
+      LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+      "hadoop_fuse_do_write wrote new version %llu for block %s blk_%llu_%llu on %zd node(s) writing %llu bytes to block offset %llu, file offset %llu, block is %llu-%llu => %d",
+      updateblockresponse->block->b->generationstamp,
+      lastlocation->b->poolid,
+      lastlocation->b->blockid,
+      lastlocation->b->generationstamp,
+      lastlocation->n_locs,
+      len,
+      offsetintofile - lastlocation->offset,
+      offsetintofile,
+      lastlocation->offset,
+      lastlocation->offset + fh->blocksize,
+      res);
 #endif
-      if(updateblockresponse)
-      {
-        hadoop__hdfs__update_block_for_pipeline_response_proto__free_unpacked(updateblockresponse, NULL);
-      }
-      if(updateresponse)
-      {
-        hadoop__hdfs__update_pipeline_response_proto__free_unpacked(updateresponse, NULL);
-      }
-      if(res < 0)
-      {
-        break; // stop writing blocks
-      }
-      else
-      {
-        byteswritten += writetothisblock;
-      }
+    if(updateblockresponse)
+    {
+      hadoop__hdfs__update_block_for_pipeline_response_proto__free_unpacked(updateblockresponse, NULL);
+    }
+    if(updateresponse)
+    {
+      hadoop__hdfs__update_pipeline_response_proto__free_unpacked(updateresponse, NULL);
+    }
+    if(res < 0)
+    {
+      return res;   // stop writing blocks
     }
   }
 
+  // TODO: fill nulls if offset after last byte.
+
   // (4) if we've still got some more to write, keep tacking on blocks
   //     and filling them
-  while(byteswritten < len && res >= 0)
+  while(bufferpos->bufferoffset < bufferpos->len && res >= 0)
   {
     Hadoop__Hdfs__AddBlockRequestProto block_request = HADOOP__HDFS__ADD_BLOCK_REQUEST_PROTO__INIT;
     Hadoop__Hdfs__AddBlockResponseProto * block_response = NULL;
-    uint64_t writetothisblock = min(len - byteswritten, fh->blocksize);
+    uint64_t len =  hadoop_fuse_bytestowrite(bufferpos, 0, fh);
 
     block_request.src = (char *) src;
     block_request.clientname = hadoop_fuse_client_name();
@@ -593,13 +592,13 @@ endwrite:
     res = CALL_NN("addBlock", block_request, block_response);
     if(res < 0)
     {
-      break;
+      return res;
     }
 
     res = hadoop_fuse_write_block(
-      data ? (data + byteswritten) : NULL,
+      bufferpos,
+      len,
       0, // block offset
-      writetothisblock,
       &checksum,
       block_response->block,
       block_response->block);
@@ -627,7 +626,7 @@ endwrite:
 #ifndef NDEBUG
       syslog(
         LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-        "hadoop_fuse_do_write added new block %s blk_%llu_%llu on %zd node(s) after %s blk_%llu_%llu & wrote %llu bytes to block offset 0 (original length %llu) => %d",
+        "hadoop_fuse_do_write added new block %s blk_%llu_%llu on %zd node(s) after %s blk_%llu_%llu & now written %zu bytes => %d",
         block_response->block->b->poolid,
         block_response->block->b->blockid,
         block_response->block->b->generationstamp,
@@ -635,12 +634,10 @@ endwrite:
         *last ? (*last)->poolid : "",
         *last ? (*last)->blockid : 0,
         *last ? (*last)->generationstamp : 0,
-        writetothisblock,
-        locations ? locations->filelength : 0,
+        bufferpos->bufferoffset,
         res);
 #endif
 
-      byteswritten += writetothisblock;
       hadoop_fuse_clone_block(block_response->block->b, last);
     }
 
@@ -1159,8 +1156,10 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
   }
   else
   {
-    char * byteskept = NULL;
-    uint64_t bytestokeep = 0;
+    struct Hadoop_Fuse_Buffer byteskept = {
+      .data = NULL,
+      .len = 0
+    };
     uint64_t bytesoffset = 0;
     uint32_t lastkeptblock = n_blocks;
 
@@ -1170,7 +1169,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
       uint64_t blockstart = block->offset;
       uint64_t blockend = blockstart + block->b->numbytes;
 
-      if(blockend < newlength)
+      if(blockend <= newlength)
       {
         // we need the whole of this block...
         lastkeptblock = b;
@@ -1180,21 +1179,21 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
       if(blockstart < newlength)
       {
         // we need some bits of this block
-        bytestokeep = newlength - blockstart;
+        byteskept.len = newlength - blockstart;
 
         // we need a bit of this block (this block of code should
         // only be executed for one of the blocks in the file). However,
         // HDFS blocks are append-only so we have to get the data we want
         // to preserve, abandon the old (longer) block, add a new (shorter)
         // block and put the data back.
-        byteskept = malloc(bytestokeep);
-        if(!byteskept)
+        byteskept.data = malloc(byteskept.len);
+        if(!byteskept.data)
         {
           res = -ENOMEM;
           goto end;
         }
 
-        res = hadoop_fuse_read(path, byteskept, bytestokeep, block->offset, fi);
+        res = hadoop_fuse_read(path, byteskept.data, byteskept.len, block->offset, fi);
         if(res < 0)
         {
           goto end;
@@ -1276,7 +1275,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
 #ifndef NDEBUG
         syslog(
           LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-          "hadoop_fuse_ftruncate, dropping block %s blk_%llu_%llu of %s as start %llu + len %llu >= new len %llu (keeping %llu bytes)",
+          "hadoop_fuse_ftruncate, dropping block %s blk_%llu_%llu of %s as start %llu + len %llu >= new len %llu (keeping %zd bytes)",
           block->b->poolid,
           block->b->blockid,
           block->b->generationstamp,
@@ -1284,7 +1283,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
           block->offset,
           block->b->numbytes,
           newlength,
-          bytestokeep);
+          byteskept.len);
 #endif
 
         res = CALL_NN("abandonBlock", abandon_request, abandon_response);
@@ -1298,17 +1297,22 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
       hadoop_fuse_clone_block(response->locations->blocks[lastkeptblock]->b, &last);
     }
 
-    if(byteskept)
+    if(byteskept.data)
     {
+      struct Hadoop_Fuse_Buffer_Pos bufferpos = {
+        .buffers = &byteskept,
+        .n_buffers = 1,
+        .bufferoffset = 0,
+        .len = byteskept.len
+      };
       res = hadoop_fuse_do_write(
         path,
-        byteskept,
-        bytestokeep,
+        &bufferpos,
         bytesoffset,
         (struct Hadoop_Fuse_FileHandle *) fi->fh,
         NULL, // we don't care about the old locations as we're appending a new block.
         &last);
-      free(byteskept);
+      free(byteskept.data);
       if(res < 0)
       {
         goto end;
@@ -1322,7 +1326,6 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
     }
   }
 
-  // persist the data we've just written, & release the lease we have on "src"
   res = 0;
 
 end:
@@ -1340,6 +1343,14 @@ int hadoop_fuse_truncate(const char * path, off_t offset)
   return hadoop_fuse_ftruncate(path, offset, NULL);
 }
 
+enum Hadoop_Fuse_Write_Buffers {
+  TRUNCATE = 0,
+  NULLPADDING = 1,
+  THEDATA = 2,
+  TRAILINGDATA = 3
+};
+#define Hadoop_Fuse_Write_Buffers_Count 4
+
 static
 int hadoop_fuse_write(
   const char * src,
@@ -1349,13 +1360,23 @@ int hadoop_fuse_write(
   struct fuse_file_info * fi)
 {
   int res;
-  int error = len; // ideally we'll write all the input
   Hadoop__Hdfs__GetBlockLocationsRequestProto request = HADOOP__HDFS__GET_BLOCK_LOCATIONS_REQUEST_PROTO__INIT;
   Hadoop__Hdfs__GetBlockLocationsResponseProto * response = NULL;
   Hadoop__Hdfs__ExtendedBlockProto * last = NULL;
   struct Hadoop_Fuse_FileHandle * fh = (struct Hadoop_Fuse_FileHandle *) fi->fh;
   uint64_t offsetintofile = offset;
+  uint64_t lastblockoffset;
   uint32_t n_blocks;
+
+  // at most 3: truncated bytes, the data itself and extract bytes.
+  struct Hadoop_Fuse_Buffer buffers[Hadoop_Fuse_Write_Buffers_Count];
+  memset(&buffers[0], 0, Hadoop_Fuse_Write_Buffers_Count * sizeof(struct Hadoop_Fuse_Buffer));
+  struct Hadoop_Fuse_Buffer_Pos bufferpos = {
+    .buffers = &buffers[0],
+    .n_buffers = Hadoop_Fuse_Write_Buffers_Count,
+    .bufferoffset = 0,
+    .len = 0
+  };
 
   request.src = (char *) src;
   request.offset = 0;
@@ -1363,56 +1384,164 @@ int hadoop_fuse_write(
   res = CALL_NN("getBlockLocations", request, response);
   if(res < 0)
   {
-    error = res;
-    goto end;
+    return res;
   }
   if(!response->locations)
   {
-    error = -ENOENT;
+    res = -ENOENT;
     goto end;
   }
   n_blocks = response->locations->n_blocks;
+  lastblockoffset = n_blocks == 0 ? 0 : response->locations->blocks[n_blocks - 1]->offset;
+
+  if(offsetintofile > response->locations->filelength)
+  {
+    // we should pad the end of the current file with nulls
+    buffers[NULLPADDING].len = response->locations->filelength - offsetintofile;
+    offsetintofile = response->locations->filelength;
+    bufferpos.len += buffers[NULLPADDING].len;
+  }
+
+  if(n_blocks > 0 && offsetintofile < lastblockoffset)
+  {
+    uint64_t truncateto;
+
+    buffers[TRAILINGDATA].len = response->locations->filelength - min(response->locations->filelength, offsetintofile + len);
+    bufferpos.len += buffers[TRAILINGDATA].len;
+
+    if(buffers[TRAILINGDATA].len > 0)
+    {
+#ifndef NDEBUG
+      syslog(
+        LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+        "hadoop_fuse_write %s stashing %zd bytes to append after write as offset %llu + len %zd < last block offset %llu",
+        src,
+        buffers[TRAILINGDATA].len,
+        offsetintofile,
+        len,
+        lastblockoffset);
+#endif
+
+      buffers[TRAILINGDATA].data = malloc(buffers[TRAILINGDATA].len);
+      if(!buffers[TRAILINGDATA].data)
+      {
+        res = -ENOMEM;
+        goto end;
+      }
+      res = hadoop_fuse_read(
+        src,
+        buffers[TRAILINGDATA].data,
+        buffers[TRAILINGDATA].len,
+        offsetintofile + len,
+        fi);
+      if(res < 0)
+      {
+        goto end;
+      }
+    }
+
+    // since we can modify the last block, we only need to throw
+    // away blocks (that we've just saved) until we are the last one.
+    // However, HDFS semantics mean we can't then overwrite this newly-
+    // uncovered last block as it's no longer "under construction". We'll
+    // therefore keep the part of that block before our write and drop
+    // (and so recreate) the whole thing.
+
+    for(uint32_t b = 0; b < n_blocks; ++b)
+    {
+      Hadoop__Hdfs__LocatedBlockProto * block = response->locations->blocks[b];
+      uint64_t blockend = block->offset + block->b->numbytes;
+
+      if(blockend < offsetintofile)
+      {
+        truncateto = blockend;
+      }
+      else
+      {
+        // we're in the first block we'll truncate
+        buffers[TRUNCATE].len = offsetintofile - block->offset;
+        bufferpos.len += buffers[TRUNCATE].len;
+
+        if(buffers[TRUNCATE].len > 0)
+        {
+          buffers[TRUNCATE].data = malloc(buffers[TRUNCATE].len);
+          if(!buffers[TRUNCATE].data)
+          {
+            res = -ENOMEM;
+            goto end;
+          }
+          res = hadoop_fuse_read(
+            src,
+            buffers[TRUNCATE].data,
+            buffers[TRUNCATE].len,
+            block->offset,
+            fi);
+          if(res < 0)
+          {
+            goto end;
+          }
+          offsetintofile -= buffers[TRUNCATE].len;
+        }
+
+        // keep our response in sync
+        n_blocks = b;
+        if(b == 0)
+        {
+          hadoop_fuse_clone_block(NULL, &last);
+        }
+        else
+        {
+          hadoop_fuse_clone_block(response->locations->blocks[b - 1]->b, &last);
+        }
+
+        break;
+      }
+    }
+
+#ifndef NDEBUG
+    syslog(
+      LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
+      "hadoop_fuse_write %s truncating down to %llu bytes",
+      src,
+      truncateto);
+#endif
+    res = hadoop_fuse_ftruncate(src, truncateto, fi);
+    if(res < 0)
+    {
+      goto end;
+    }
+  }
 
   res = hadoop_fuse_lock(src, &last);
   if(res < 0)
   {
-    error = res;
     goto end;
   }
 
-  if(n_blocks == 0 || offsetintofile >= response->locations->blocks[n_blocks - 1]->offset)
-  {
-    // the easy case: we're modifying the last block
-    res = hadoop_fuse_do_write(
-      src,
-      data,
-      len,
-      offsetintofile,
-      fh,
-      response->locations,
-      &last);
-    if(res < 0)
-    {
-      error = res;
-      // the write failed, but we still need to unlock the file by
-      // "completing" it.
-      // goto end;
-    }
-  }
-  else
-  {
-    assert(false);
-  }
+  buffers[THEDATA].data = (char *) data;
+  buffers[THEDATA].len = len;
+  bufferpos.len += len;
+
+  res = hadoop_fuse_do_write(
+    src,
+    &bufferpos,
+    offsetintofile,
+    fh,
+    n_blocks == 0 ? NULL : response->locations->blocks[n_blocks - 1],
+    &last);
 
   // persist the data we've just written, & release the lease we have on "src"
-  res = hadoop_fuse_complete(src, fh->fileid, last);
-  if(res < 0)
   {
-    error = res;
-    goto end;
+    int complete = hadoop_fuse_complete(src, fh->fileid, last);
+    if(res >= 0 && complete < 0)
+    {
+      res = complete; // use this error if we don't have another
+    }
   }
 
 end:
+  free(buffers[TRUNCATE].data);
+  free(buffers[TRAILINGDATA].data);
   if(response)
   {
     hadoop__hdfs__get_block_locations_response_proto__free_unpacked(response, NULL);
@@ -1422,7 +1551,7 @@ end:
     // these are clones, so we have to free them
     hadoop__hdfs__extended_block_proto__free_unpacked(last, NULL);
   }
-  return error;
+  return res < 0 ? res : len;
 }
 
 static
