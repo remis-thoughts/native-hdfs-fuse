@@ -214,6 +214,8 @@ static pthread_once_t crc32c_once_hw = PTHREAD_ONCE_INIT;
 static uint32_t crc32c_long[4][256];
 static uint32_t crc32c_short[4][256];
 
+static uint32_t (* crc32c_fn)(uint32_t crc, const void * buf, size_t len) = NULL;
+
 /* Initialize tables for shifting crcs. */
 static void crc32c_init_hw(void)
 {
@@ -330,10 +332,14 @@ static uint32_t crc32c_hw(uint32_t crc, const void * buf, size_t len)
    version.  Otherwise, use the software version. */
 uint32_t crc32c(uint32_t crc, const void * buf, size_t len)
 {
-  int sse42;
+  if(!crc32c_fn)
+  {
+    int sse42;
 
-  SSE42(sse42);
-  return sse42 ? crc32c_hw(crc, buf, len) : crc32c_sw(crc, buf, len);
+    SSE42(sse42);
+    crc32c_fn = sse42 ? crc32c_hw : crc32c_sw;
+  }
+  return crc32c_fn(crc, buf, len);
 }
 
 #ifdef TEST
