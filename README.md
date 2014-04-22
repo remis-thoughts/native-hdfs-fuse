@@ -16,7 +16,7 @@ You can make a debug build using <tt>make debug</tt>; this adds debug symbols to
 
 ### Running
 
-    native-hdfs-fuse &lt;namenode host&gt; &lt;namenode port, usually 8020&gt; &lt;other FUSE arguments, including mount directory&gt; 
+    native-hdfs-fuse <namenode host> <namenode port, usually 8020> <other FUSE arguments, including mount directory>
 
 ## Testing
 
