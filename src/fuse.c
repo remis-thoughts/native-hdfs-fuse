@@ -1551,7 +1551,7 @@ end:
     // these are clones, so we have to free them
     hadoop__hdfs__extended_block_proto__free_unpacked(last, NULL);
   }
-  return res < 0 ? res : len;
+  return res < 0 ? res : (int) len;
 }
 
 static
