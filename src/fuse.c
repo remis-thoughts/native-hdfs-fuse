@@ -27,6 +27,7 @@
 #include <execinfo.h>
 #include <assert.h>
 #include <syslog.h>
+#include <signal.h>
 #endif
 
 #include "proto/ClientNamenodeProtocol.pb-c.h"
@@ -110,6 +111,8 @@ void unpack_filestatus(Hadoop__Hdfs__HdfsFileStatusProto * fs, struct stat * stb
     stbuf->st_mode = S_IFLNK;
     break;
   }
+  default:
+    break;
   }
   if(fs->permission)
   {
@@ -146,7 +149,7 @@ void unpack_filestatus(Hadoop__Hdfs__HdfsFileStatusProto * fs, struct stat * stb
 #ifndef NDEBUG
   syslog(
     LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "unpack_filestatus, length=%llu blocksize=%zd",
+    "unpack_filestatus, length=%" PRIu64 " blocksize=%zd",
     stbuf->st_size,
     stbuf->st_blksize);
 #endif
@@ -219,7 +222,7 @@ int hadoop_fuse_complete(const char * src, uint64_t fileid, Hadoop__Hdfs__Extend
   {
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_complete %s (fileid %llu) last block %s blk_%llu_%llu (length = %llu) => %d",
+      "hadoop_fuse_complete %s (fileid %" PRIu64 ") last block %s blk_%" PRIu64 "_%" PRIu64 " (length = %" PRIu64 ") => %d",
       src,
       fileid,
       last->poolid,
@@ -232,7 +235,7 @@ int hadoop_fuse_complete(const char * src, uint64_t fileid, Hadoop__Hdfs__Extend
   {
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_complete %s (fileid %llu) with NO last block => %d",
+      "hadoop_fuse_complete %s (fileid %" PRIu64 ") with NO last block => %d",
       src,
       fileid,
       res);
@@ -347,7 +350,6 @@ int hadoop_fuse_write_block(
   uint64_t newblocklen = max(newblock->b->has_numbytes ? newblock->b->numbytes : 0, blockoffset + len);
 
   assert(bufferpos->len > 0);
-  assert(bufferpos->bufferoffset >= 0);
   assert(block->n_locs > 0);
 
   clientheader.clientname = hadoop_fuse_client_name();
@@ -416,7 +418,7 @@ int hadoop_fuse_write_block(
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_write_block, %s %llu bytes to block offset %llu of block %s blk_%llu_%llu (was: %llu, now: %llu) to DN %s:%d (%zd of %zd) => %d",
+      "hadoop_fuse_write_block, %s %" PRIu64 " bytes to block offset %" PRIu64 " of block %s blk_%" PRIu64 "_%" PRIu64 " (was: %" PRIu64 ", now: %" PRIu64 ") to DN %s:%d (%zd of %zd) => %d",
       (written ? "written" : "NOT written"),
       len,
       blockoffset,
@@ -544,7 +546,7 @@ endwrite:
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_do_write wrote new version %llu for block %s blk_%llu_%llu on %zd node(s) writing %llu bytes to block offset %llu, file offset %llu, block is %llu-%llu => %d",
+      "hadoop_fuse_do_write wrote new version %" PRIu64 " for block %s blk_%" PRIu64 "_%" PRIu64 " on %zd node(s) writing %" PRIu64 " bytes to block offset %" PRIu64 ", file offset %" PRIu64 ", block is %" PRIu64 "-%" PRIu64 " => %d",
       updateblockresponse->block->b->generationstamp,
       lastlocation->b->poolid,
       lastlocation->b->blockid,
@@ -626,7 +628,7 @@ endwrite:
 #ifndef NDEBUG
       syslog(
         LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-        "hadoop_fuse_do_write added new block %s blk_%llu_%llu on %zd node(s) after %s blk_%llu_%llu & now written %zu bytes => %d",
+        "hadoop_fuse_do_write added new block %s blk_%" PRIu64 "_%" PRIu64 " on %zd node(s) after %s blk_%" PRIu64 "_%" PRIu64 " & now written %zu bytes => %d",
         block_response->block->b->poolid,
         block_response->block->b->blockid,
         block_response->block->b->generationstamp,
@@ -1125,7 +1127,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_ftruncate, writing %llu bytes to %s to ftruncate size up to %llu (from %llu)",
+      "hadoop_fuse_ftruncate, writing %" PRIu64 " bytes to %s to ftruncate size up to %" PRIu64 " (from %" PRIu64 ")",
       newlength - oldlength,
       path,
       newlength,
@@ -1148,7 +1150,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_ftruncate making no changes to %s (size %llu)",
+      "hadoop_fuse_ftruncate making no changes to %s (size %" PRIu64 ")",
       path,
       oldlength);
 #endif
@@ -1275,7 +1277,7 @@ int hadoop_fuse_ftruncate(const char * path, off_t offset, struct fuse_file_info
 #ifndef NDEBUG
         syslog(
           LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-          "hadoop_fuse_ftruncate, dropping block %s blk_%llu_%llu of %s as start %llu + len %llu >= new len %llu (keeping %zd bytes)",
+          "hadoop_fuse_ftruncate, dropping block %s blk_%" PRIu64 "_%" PRIu64 " of %s as start %" PRIu64 " + len %" PRIu64 " >= new len %" PRIu64 " (keeping %zd bytes)",
           block->b->poolid,
           block->b->blockid,
           block->b->generationstamp,
@@ -1414,7 +1416,7 @@ int hadoop_fuse_write(
 #ifndef NDEBUG
       syslog(
         LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-        "hadoop_fuse_write %s stashing %zd bytes to append after write as offset %llu + len %zd < last block offset %llu",
+        "hadoop_fuse_write %s stashing %zd bytes to append after write as offset %" PRIu64 " + len %zd < last block offset %" PRIu64 "",
         src,
         buffers[TRAILINGDATA].len,
         offsetintofile,
@@ -1501,7 +1503,7 @@ int hadoop_fuse_write(
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_write %s truncating down to %llu bytes",
+      "hadoop_fuse_write %s truncating down to %" PRIu64 " bytes",
       src,
       truncateto);
 #endif
@@ -1656,7 +1658,7 @@ int hadoop_fuse_read(const char * src, char * buf, size_t size, off_t offset, st
 #ifndef NDEBUG
     syslog(
       LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-      "hadoop_fuse_read, %s %llu (of %llu) bytes at offset %llu of block %s blk_%llu_%llu => %d",
+      "hadoop_fuse_read, %s %" PRIu64 " (of %" PRIu64 ") bytes at offset %" PRIu64 " of block %s blk_%" PRIu64 "_%" PRIu64 " => %d",
       (read ? "read" : "NOT read"),
       op.len,
       block->b->numbytes,
@@ -1752,7 +1754,7 @@ int main(int argc, char * argv[])
   signal(SIGSEGV, dump_trace);
   syslog(
     LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "connected to hdfs://%s:%d, defaults: packetsize=%u, blocksize=%llu, replication=%u, bytesperchecksum=%u, checksumtype=%u",
+    "connected to hdfs://%s:%d, defaults: packetsize=%u, blocksize=%" PRIu64 ", replication=%u, bytesperchecksum=%u, checksumtype=%u",
     argv[1],
     port,
     state.packetsize,

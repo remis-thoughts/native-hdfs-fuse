@@ -189,7 +189,7 @@ int hadoop_rpc_call_namenode_withlock(
         break;
       case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_ERROR_CODE_PROTO__FATAL_INVALID_RPC_HEADER:
       case HADOOP__COMMON__RPC_RESPONSE_HEADER_PROTO__RPC_ERROR_CODE_PROTO__ERROR_RPC_SERVER:
-        res = -EBADMSG;
+        res = -EBADR;
         break;
       default:
         res = -EINVAL;
@@ -795,7 +795,7 @@ endpacket:
 #ifndef NDEBUG
   syslog(
     LOG_MAKEPRI(LOG_USER, LOG_DEBUG),
-    "hadoop_rpc_send_packet, %s seqno=%llu |data|=%zd |packet|=%u |header|=%u offset=%zd with %u checksums => %d",
+    "hadoop_rpc_send_packet, %s seqno=%" PRIu64 " |data|=%zd |packet|=%u |header|=%u offset=%zd with %u checksums => %d",
     res < 0 ? "FAILED to send" : "sent",
     seqno,
     len,
