@@ -8,7 +8,20 @@ Unlike [other FUSE HDFS implementations](https://wiki.apache.org/hadoop/Mountabl
 
 ### Compiling
 
-    make && make install
+<details closed>
+<summary>Dependencies for Ubuntu (22.04)</summary>
+
+```bash
+sudo apt-get install -y pkgconf libfuse-dev libprotobuf-c-dev libprotobuf-dev protobuf-c-compiler uncrustify
+```
+
+</details>
+
+Compile the program :
+
+```sh
+make && make install
+```
 
 This will compile and install the <tt>native-hdfs-fuse</tt> binary to <tt>/usr/bin</tt>. The build process needs the [protoc-c](https://github.com/protobuf-c/protobuf-c) protobuf compiler available and uses [pkg-config](http://www.freedesktop.org/wiki/Software/pkg-config) to find the <tt>fuse</tt> and <tt>libprotobuf-c</tt> shared libraries it needs to link to.
 
@@ -16,7 +29,9 @@ You can make a debug build using <tt>make debug</tt>; this adds debug symbols to
 
 ### Running
 
-    native-hdfs-fuse <namenode host> <namenode port, usually 8020> <other FUSE arguments, including mount directory>
+```sh
+native-hdfs-fuse <namenode host> <namenode port, usually 8020> <other FUSE arguments, including mount directory>
+```
 
 ## Testing
 
