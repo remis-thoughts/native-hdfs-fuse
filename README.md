@@ -23,7 +23,7 @@ Compile the program :
 make && make install
 ```
 
-This will compile and install the <tt>native-hdfs-fuse</tt> binary to <tt>/usr/bin</tt>. The build process needs the [protoc-c](https://github.com/protobuf-c/protobuf-c) protobuf compiler available and uses [pkg-config](http://www.freedesktop.org/wiki/Software/pkg-config) to find the <tt>fuse</tt> and <tt>libprotobuf-c</tt> shared libraries it needs to link to.
+This will compile and install the <tt>native-hdfs-fuse</tt> binary to <tt>/usr/bin</tt>. The build process needs the [protoc-c](https://github.com/protobuf-c/protobuf-c) protobuf compiler available and uses [pkg-config](http://www.freedesktop.org/wiki/Software/pkg-config) to find the <tt>fuse</tt> and <tt>libprotobuf-c</tt> shared libraries it needs to link to. Additionally, [uncrustify](https://github.com/uncrustify/uncrustify) version 0.60 or higher is required.
 
 You can make a debug build using <tt>make debug</tt>; this adds debug symbols to the binary and compiles in verbose logging statements.
 
