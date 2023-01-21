@@ -13,7 +13,7 @@ build/proto: proto/*.proto build
 	$(UNCRUSTIFY) proto/*.[ch]
 	touch build/proto
 
-CCFLAGS := $(shell pkg-config --cflags --libs fuse libprotobuf-c) -Werror -Wall -Wextra -I. -std=gnu99
+CCFLAGS := $(shell pkg-config --cflags --libs fuse libprotobuf-c) -Werror -Wall -Wextra -I. -std=gnu99 -Wno-unused
 
 build/native-hdfs-fuse: src/*.c src/*.h build/proto build
 	mkdir -p build
